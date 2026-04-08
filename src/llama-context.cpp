@@ -5,11 +5,13 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama.h"
+#include "llama-triattention.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -3340,6 +3342,94 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     }
 
     return mem->get_can_shift();
+}
+
+int32_t llama_triattention_init(
+        struct llama_context * ctx,
+                  const char * stats_path,
+                     int32_t   budget,
+                     int32_t   divide_length,
+                     int32_t   offset_max,
+                     int32_t   mode,
+                     int32_t   trigger,
+                     int32_t   agg,
+                     int32_t   seed,
+                        bool   normalize_scores,
+                        bool   protect_prefill,
+                        bool   disable_mlr,
+                        bool   disable_trig,
+                        bool   enable_logging,
+                     int32_t   fallback_mode,
+                        float   fallback_recency_weight) {
+    if (!ctx) {
+        return -1;
+    }
+
+    auto * mem = ctx->get_memory();
+    if (!mem) {
+        LLAMA_LOG_ERROR("%s: context has no memory\n", __func__);
+        return -1;
+    }
+
+    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
+    if (!kv) {
+        LLAMA_LOG_ERROR("%s: memory is not a KV cache (recurrent models not supported)\n", __func__);
+        return -1;
+    }
+
+    triattention_config cfg = {};
+    cfg.budget           = (uint32_t)budget;
+    cfg.divide_length    = (uint32_t)divide_length;
+    cfg.offset_max       = (uint32_t)offset_max;
+    cfg.mode             = (triattention_mode)mode;
+    cfg.trigger          = (triattention_trigger)trigger;
+    cfg.agg              = (triattention_agg)agg;
+    cfg.seed             = seed;
+    cfg.normalize_scores = normalize_scores;
+    cfg.protect_prefill  = protect_prefill;
+    cfg.disable_mlr      = disable_mlr;
+    cfg.disable_trig     = disable_trig;
+    cfg.enable_logging   = enable_logging;
+    cfg.fallback_mode    = (triattention_fallback) fallback_mode;
+    cfg.fallback_recency_weight = fallback_recency_weight;
+
+    const llama_model & model = ctx->get_model();
+    const llama_hparams & hparams = model.hparams;
+    const llama_cparams & cparams = ctx->get_cparams();
+
+    uint32_t rope_style = 0;
+    switch (llama_model_rope_type(&model)) {
+        case LLAMA_ROPE_TYPE_NORM:
+            rope_style = 1;
+            break;
+        case LLAMA_ROPE_TYPE_NEOX:
+        case LLAMA_ROPE_TYPE_MROPE:
+        case LLAMA_ROPE_TYPE_IMROPE:
+            rope_style = 0;
+            break;
+        default:
+            LLAMA_LOG_ERROR("%s: unsupported rope type %d for TriAttention\n",
+                    __func__, (int) llama_model_rope_type(&model));
+            return -1;
+    }
+
+    triattention_model_params model_params = {};
+    model_params.kv_size           = kv->get_size();
+    model_params.head_dim          = hparams.n_embd_head_k(0);
+    model_params.num_layers        = hparams.n_layer;
+    model_params.num_attn_heads    = hparams.n_head(0);
+    model_params.num_kv_heads      = hparams.n_head_kv(0);
+    model_params.rope_style        = rope_style;
+    model_params.n_ctx_orig        = hparams.n_ctx_orig_yarn;
+    model_params.rope_theta        = (double) cparams.rope_freq_base;
+    model_params.rope_freq_scale   = cparams.rope_freq_scale;
+    model_params.rope_ext_factor   = cparams.yarn_ext_factor;
+    model_params.rope_attn_factor  = cparams.yarn_attn_factor;
+    model_params.rope_beta_fast    = cparams.yarn_beta_fast;
+    model_params.rope_beta_slow    = cparams.yarn_beta_slow;
+
+    kv->init_triattention(stats_path, &cfg, &model_params);
+    return kv->has_triattention() ? 0 : -1;
 }
 
 // llama state API

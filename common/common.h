@@ -681,6 +681,24 @@ struct common_params {
     llama_progress_callback load_progress_callback = NULL;
     void *                  load_progress_callback_user_data = NULL;
     bool no_alloc = false; // Don't allocate model buffers
+
+    // TriAttention KV cache eviction (arXiv 2604.04921)
+    std::string triattention_stats;                // path to .triattention calibration file
+    bool        triattention_requested    = false; // any TriAttention CLI flag was provided
+    int32_t     triattention_budget       = 2048;  // max KV entries to retain after pruning
+    int32_t     triattention_window       = 128;   // pruning interval (divide_length) in tokens
+    int32_t     triattention_offset_max   = 65536; // max geometric offset for scoring
+    int32_t     triattention_mode         = 0;     // 0=global, 1=per-kv-head, 2=per-layer-head
+    int32_t     triattention_trigger      = 0;     // 0=interval, 1=slack
+    int32_t     triattention_agg          = 0;     // 0=mean, 1=max
+    int32_t     triattention_seed         = 0;     // RNG seed for tie-breaking (-1 to disable)
+    int32_t     triattention_fallback     = 1;     // 0=off, 1=auto, 2=hybrid-norm-recency
+    float       triattention_fallback_recency_weight = 0.25f;
+    bool        triattention_normalize    = false;  // z-score normalize per head
+    bool        triattention_protect_prefill = true; // never evict prompt tokens
+    bool        triattention_disable_mlr  = false;  // ablation: disable MLR weighting
+    bool        triattention_disable_trig = false;  // ablation: norm-only scoring
+    bool        triattention_log          = false;  // log pruning events to stderr
 };
 
 // call once at the start of a program if it uses libcommon

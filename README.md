@@ -1,6 +1,8 @@
 > [!IMPORTANT]
 > This repository is a mirror of the upstream project [`atomicmilkshake/llama-cpp-turboquant`](https://github.com/atomicmilkshake/llama-cpp-turboquant).
 
+---
+
 # llama.cpp — TurboQuant + TriAttention
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)

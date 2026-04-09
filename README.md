@@ -1,5 +1,5 @@
 > [!IMPORTANT]
-> This repository is aт experimental mirror of the upstream project [`atomicmilkshake/llama-cpp-turboquant`](https://github.com/atomicmilkshake/llama-cpp-turboquant).
+> This repository is an experimental mirror of the upstream project [`atomicmilkshake/llama-cpp-turboquant`](https://github.com/atomicmilkshake/llama-cpp-turboquant).
 
 > [!WARNING]
 > DO NOT USE THIS REPOSITORY FOR PRODUCTION.

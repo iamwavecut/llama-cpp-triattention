@@ -2,6 +2,9 @@
 
 #include "llama-triattention.h"
 
+struct llama_model;
+struct llama_cparams;
+
 struct triattention_rope_params {
     uint32_t n_dims;
     uint32_t n_ctx_orig;
@@ -23,9 +26,21 @@ bool triattention_build_rope_arrays(
     uint32_t freq_count,
     const triattention_rope_params * params);
 
+void triattention_model_params_clear(triattention_model_params * model);
+bool triattention_model_params_init(
+    const llama_model * model,
+    const llama_cparams * cparams,
+    uint32_t kv_size,
+    triattention_model_params * out);
+
 triattention_calibration * triattention_calibration_load(const char * path, bool verbose = true);
 bool triattention_calibration_save(const char * path, const triattention_calibration * cal);
 void triattention_calibration_free(triattention_calibration * cal);
+
+triattention_calibration * triattention_calibration_subset(
+    const triattention_calibration * cal,
+    const uint32_t * sampled_layers,
+    uint32_t n_sampled_layers);
 
 bool triattention_calibration_validate(
     const triattention_calibration * cal,
@@ -33,4 +48,6 @@ bool triattention_calibration_validate(
     bool warn_rope_theta = true);
 
 triattention_calibration * triattention_calibration_create_fallback(
-    const triattention_model_params * model);
+    const triattention_model_params * model,
+    const uint32_t * sampled_layers = nullptr,
+    uint32_t n_sampled_layers = 0);

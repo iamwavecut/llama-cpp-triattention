@@ -1,8 +1,10 @@
 #include "llama-triattention-file.h"
 #include "testing.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 
@@ -15,7 +17,65 @@ static std::filesystem::path temp_path(const char * name) {
         (std::string(name) + "-" + std::to_string(std::rand()) + ".triattention");
 }
 
-static triattention_calibration * make_v2_calibration() {
+static void populate_uniform_layer(triattention_layer_params * layer, uint32_t kv_source_layer) {
+    std::memset(layer, 0, sizeof(*layer));
+    layer->head_dim = 4;
+    layer->rope_dim = 4;
+    layer->rope_offset = 0;
+    layer->num_attn_heads = 4;
+    layer->num_kv_heads = 2;
+    layer->num_kv_groups = 2;
+    layer->kv_source_layer = kv_source_layer;
+    layer->rope_style = 0;
+    layer->freq_count = 2;
+    layer->n_ctx_orig = 128;
+    layer->rope_theta = 10000.0;
+    layer->rope_freq_scale = 1.0f;
+    layer->rope_ext_factor = 0.0f;
+    layer->rope_attn_factor = 1.0f;
+    layer->rope_beta_fast = 32.0f;
+    layer->rope_beta_slow = 1.0f;
+    layer->omega = new float[2] { 1.0f, 0.5f };
+    layer->freq_scale_sq = new float[2] { 2.0f, 3.0f };
+}
+
+static triattention_model_params make_uniform_model_params(uint32_t num_layers, uint32_t head_dim = 4) {
+    triattention_model_params model = {};
+    model.num_layers = num_layers;
+    model.head_dim = head_dim;
+    model.rope_dim = head_dim;
+    model.num_attn_heads = 4;
+    model.num_kv_heads = 2;
+    model.rope_style = 0;
+    model.n_ctx_orig = 128;
+    model.rope_theta = 10000.0;
+    model.rope_freq_scale = 1.0f;
+    model.rope_ext_factor = 0.0f;
+    model.rope_attn_factor = 1.0f;
+    model.rope_beta_fast = 32.0f;
+    model.rope_beta_slow = 1.0f;
+    model.max_head_dim = head_dim;
+    model.max_rope_dim = head_dim;
+    model.max_freq_count = head_dim / 2;
+    model.layers = new triattention_layer_params[num_layers];
+    for (uint32_t il = 0; il < num_layers; ++il) {
+        populate_uniform_layer(&model.layers[il], il);
+        model.layers[il].head_dim = head_dim;
+        model.layers[il].rope_dim = head_dim;
+        model.layers[il].freq_count = head_dim / 2;
+        delete[] model.layers[il].omega;
+        delete[] model.layers[il].freq_scale_sq;
+        model.layers[il].omega = new float[head_dim / 2];
+        model.layers[il].freq_scale_sq = new float[head_dim / 2];
+        for (uint32_t f = 0; f < head_dim / 2; ++f) {
+            model.layers[il].omega[f] = 1.0f / (float) (f + 1);
+            model.layers[il].freq_scale_sq[f] = 1.0f + (float) f;
+        }
+    }
+    return model;
+}
+
+static triattention_calibration * make_v3_calibration() {
     auto * cal = new triattention_calibration();
     std::memset(cal, 0, sizeof(*cal));
 
@@ -33,6 +93,12 @@ static triattention_calibration * make_v2_calibration() {
 
     cal->omega = new float[2] { 1.0f, 0.5f };
     cal->freq_scale_sq = new float[2] { 2.0f, 3.0f };
+    cal->layers = new triattention_layer_params[2];
+    populate_uniform_layer(&cal->layers[0], 0);
+    populate_uniform_layer(&cal->layers[1], 1);
+    cal->max_head_dim = 4;
+    cal->max_rope_dim = 4;
+    cal->max_freq_count = 2;
     cal->sampled_layer = new uint32_t[2] { 0, 1 };
     cal->sampled_head  = new uint32_t[2] { 0, 2 };
     cal->head_stats    = new triattention_head_stats[2];
@@ -103,7 +169,7 @@ int main() {
 
     t.test("v2 calibration roundtrip", [](testing & t) {
         const std::filesystem::path path = temp_path("triattention-v2");
-        triattention_calibration * cal = make_v2_calibration();
+        triattention_calibration * cal = make_v3_calibration();
 
         t.assert_true(triattention_calibration_save(path.string().c_str(), cal));
 
@@ -111,10 +177,12 @@ int main() {
         t.assert_true(loaded != nullptr);
         t.assert_equal((uint32_t) TRIATTENTION_VERSION, loaded->version);
         t.assert_equal((uint32_t) 2, loaded->n_sampled);
+        t.assert_true(loaded->layers != nullptr);
         t.assert_true(loaded->omega != nullptr);
         t.assert_true(loaded->freq_scale_sq != nullptr);
         t.assert_true(approx_equal(loaded->omega[1], 0.5f));
         t.assert_true(approx_equal(loaded->freq_scale_sq[0], 2.0f));
+        t.assert_equal((uint32_t) 1, loaded->layers[1].kv_source_layer);
         t.assert_true(approx_equal(loaded->head_stats[1].q_mean_imag[1], 5.0f));
         t.assert_true(approx_equal(loaded->head_stats[1].r_f[0], 0.2f));
 
@@ -133,31 +201,34 @@ int main() {
         t.assert_true(cal->omega == nullptr);
         t.assert_true(cal->freq_scale_sq == nullptr);
 
-        triattention_model_params model = {};
-        model.head_dim = 4;
-        model.num_layers = 1;
+        triattention_model_params model = make_uniform_model_params(1);
         model.num_attn_heads = 2;
         model.num_kv_heads = 1;
-        model.rope_style = 0;
-        model.rope_theta = 10000.0;
+        model.layers[0].num_attn_heads = 2;
+        model.layers[0].num_kv_heads = 1;
+        model.layers[0].num_kv_groups = 2;
         t.assert_true(triattention_calibration_validate(cal, &model, true));
 
         triattention_calibration_free(cal);
+        triattention_model_params_clear(&model);
         std::filesystem::remove(path);
     });
 
     t.test("validation rejects head mismatch", [](testing & t) {
-        triattention_calibration * cal = make_v2_calibration();
-        triattention_model_params model = {};
+        triattention_calibration * cal = make_v3_calibration();
+        triattention_model_params model = make_uniform_model_params(cal->num_layers);
         model.head_dim = 8;
-        model.num_layers = cal->num_layers;
-        model.num_attn_heads = cal->num_attn_heads;
-        model.num_kv_heads = cal->num_kv_heads;
-        model.rope_style = cal->rope_style;
-        model.rope_theta = cal->rope_theta;
+        model.rope_dim = 8;
+        model.max_head_dim = 8;
+        model.max_rope_dim = 8;
+        model.max_freq_count = 4;
+        model.layers[0].head_dim = 8;
+        model.layers[0].rope_dim = 8;
+        model.layers[0].freq_count = 4;
 
         t.assert_true(!triattention_calibration_validate(cal, &model, false));
         triattention_calibration_free(cal);
+        triattention_model_params_clear(&model);
     });
 
     t.test("truncated file is rejected", [](testing & t) {

@@ -12,6 +12,9 @@ class llama_batch_allocr;
 
 class llama_io_write_i;
 class llama_io_read_i;
+struct llama_model;
+struct llama_cparams;
+struct triattention_config;
 
 struct llama_memory_params {
     // kv cache
@@ -126,6 +129,22 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    //
+    // TriAttention integration
+    //
+
+    virtual int32_t triattention_init_from_model(
+        const llama_model &,
+        const llama_cparams &,
+        const char *,
+        const triattention_config *) {
+        return -1;
+    }
+
+    virtual bool triattention_is_active() const {
+        return false;
+    }
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

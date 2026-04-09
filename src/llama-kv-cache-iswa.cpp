@@ -3,9 +3,11 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-model.h"
+#include "llama-triattention.h"
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 
 //
 // llama_kv_cache_iswa
@@ -237,6 +239,46 @@ void llama_kv_cache_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     }
 
     kv_swa->state_read(io, seq_id, flags);
+}
+
+int32_t llama_kv_cache_iswa::triattention_init_from_model(
+    const llama_model & model,
+    const llama_cparams & cparams,
+    const char * stats_path,
+    const triattention_config * cfg) {
+    if (!cfg) {
+        return -1;
+    }
+
+    triattention_config cfg_base = *cfg;
+    triattention_config cfg_swa  = *cfg;
+
+    const uint32_t size_base  = kv_base->get_size();
+    const uint32_t size_swa   = kv_swa->get_size();
+    const uint32_t total_size = std::max<uint32_t>(1, size_base + size_swa);
+
+    uint32_t budget_base = std::min(cfg->budget, size_base);
+    uint32_t budget_swa  = std::min(cfg->budget > budget_base ? cfg->budget - budget_base : 0u, size_swa);
+    if (cfg->budget > 0 && size_base > 0 && size_swa > 0) {
+        budget_base = std::min(size_base, (uint32_t) llround((double) cfg->budget * (double) size_base / (double) total_size));
+        budget_base = std::max<uint32_t>(1, budget_base);
+        budget_swa = cfg->budget > budget_base ? cfg->budget - budget_base : 1u;
+        budget_swa = std::min(size_swa, std::max<uint32_t>(1, budget_swa));
+        if (budget_base + budget_swa > cfg->budget && budget_base > 1) {
+            budget_base = cfg->budget - budget_swa;
+        }
+    }
+
+    cfg_base.budget = std::min(size_base, budget_base);
+    cfg_swa.budget  = std::min(size_swa,  budget_swa);
+
+    const int32_t rc_base = kv_base->triattention_init_from_model(model, cparams, stats_path, &cfg_base);
+    const int32_t rc_swa  = kv_swa->triattention_init_from_model(model, cparams, stats_path, &cfg_swa);
+    return (rc_base == 0 || rc_swa == 0) ? 0 : -1;
+}
+
+bool llama_kv_cache_iswa::triattention_is_active() const {
+    return kv_base->triattention_is_active() || kv_swa->triattention_is_active();
 }
 
 llama_kv_cache * llama_kv_cache_iswa::get_base() const {

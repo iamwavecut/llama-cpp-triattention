@@ -75,6 +75,14 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
 
+    int32_t triattention_init_from_model(
+        const llama_model & model,
+        const llama_cparams & cparams,
+        const char * stats_path,
+        const triattention_config * cfg) override;
+
+    bool triattention_is_active() const override;
+
     //
     // llama_memory_hybrid specific API
     //

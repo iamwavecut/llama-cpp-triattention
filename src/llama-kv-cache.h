@@ -146,6 +146,14 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
+    int32_t triattention_init_from_model(
+        const llama_model & model,
+        const llama_cparams & cparams,
+        const char * stats_path,
+        const triattention_config * cfg) override;
+
+    bool triattention_is_active() const override;
+
     //
     // llama_kv_cache specific API
     //
@@ -226,7 +234,12 @@ public:
 
     // Initialize TriAttention on this cache. Called after construction.
     // Does nothing if stats_path is nullptr or empty.
-    void init_triattention(const char * stats_path, const triattention_config * cfg, const triattention_model_params * model_params);
+    void init_triattention(
+        const char * stats_path,
+        const triattention_config * cfg,
+        const triattention_model_params * model_params,
+        const uint32_t * sampled_layers,
+        uint32_t n_sampled_layers);
 
     // Attempt TriAttention pruning if conditions are met (trigger check + prune).
     // Called automatically from apply_ubatch(). Can also be called explicitly.

@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 static float triattention_tensor_get_f32(
     const ggml_tensor * t,
@@ -55,7 +56,7 @@ bool triattention_parse_layer_index(const char * name, uint32_t * layer_idx) {
         ++p;
     }
 
-    *layer_idx = (uint32_t) value;
+    *layer_idx = value;
     return true;
 }
 
@@ -112,13 +113,12 @@ bool triattention_extract_rope_params(
 
 triattention_calibration_builder::triattention_calibration_builder(
     std::string model_name,
-    uint32_t num_layers,
-    uint32_t num_attn_heads,
-    uint32_t num_kv_heads)
+    const triattention_model_params * model)
     : model_name_(std::move(model_name))
-    , num_layers_(num_layers)
-    , num_attn_heads_(num_attn_heads)
-    , num_kv_heads_(num_kv_heads) {
+    , model_(model) {
+    if (model_) {
+        layers_.resize(model_->num_layers);
+    }
 }
 
 void triattention_calibration_builder::note_rope_source(const char * name) {
@@ -132,22 +132,28 @@ void triattention_calibration_builder::note_rope_source(const char * name) {
     }
 }
 
-size_t triattention_calibration_builder::head_offset(uint32_t layer_idx, uint32_t head_idx, uint32_t freq_idx) const {
-    return ((size_t) layer_idx * num_attn_heads_ + head_idx) * freq_count_ + freq_idx;
+size_t triattention_calibration_builder::head_offset(const layer_accum & layer, uint32_t head_idx, uint32_t freq_idx) const {
+    return (size_t) head_idx * layer.freq_count + freq_idx;
 }
 
 bool triattention_calibration_builder::ensure_layout(
     const ggml_tensor * src0,
     uint32_t layer_idx,
     uint32_t rope_style,
+    const triattention_rope_params & rope_params,
     std::string * error) {
+    if (!model_ || !model_->layers || layer_idx >= model_->num_layers) {
+        if (error) {
+            *error = "layer index out of range";
+        }
+        return false;
+    }
     if (!src0) {
         if (error) {
             *error = "missing rope source tensor";
         }
         return false;
     }
-
     if (src0->ne[3] != 1) {
         if (error) {
             *error = "only single-batch decoder-only query tensors are supported";
@@ -156,19 +162,7 @@ bool triattention_calibration_builder::ensure_layout(
     }
     if (src0->ne[0] <= 0 || (src0->ne[0] % 2) != 0) {
         if (error) {
-            *error = "query tensor head_dim must be even";
-        }
-        return false;
-    }
-    if ((uint32_t) src0->ne[1] != num_attn_heads_) {
-        if (error) {
-            *error = "query tensor attention head count does not match model metadata";
-        }
-        return false;
-    }
-    if (layer_idx >= num_layers_) {
-        if (error) {
-            *error = "layer index out of range";
+            *error = "query tensor rope_dim must be even";
         }
         return false;
     }
@@ -179,50 +173,67 @@ bool triattention_calibration_builder::ensure_layout(
         return false;
     }
 
-    const uint32_t observed_head_dim = (uint32_t) src0->ne[0];
-    if (head_dim_ == 0) {
-        head_dim_ = observed_head_dim;
-        freq_count_ = head_dim_ / 2;
-        rope_style_ = rope_style;
-
-        const size_t total = (size_t) num_layers_ * num_attn_heads_ * freq_count_;
-        sum_real_.assign(total, 0.0);
-        sum_imag_.assign(total, 0.0);
-        sum_abs_.assign(total, 0.0);
-        counts_.assign((size_t) num_layers_ * num_attn_heads_, 0);
-    } else if (head_dim_ != observed_head_dim || rope_style_ != rope_style) {
+    const triattention_layer_params & expected = model_->layers[layer_idx];
+    if ((uint32_t) src0->ne[1] != expected.num_attn_heads) {
         if (error) {
-            *error = "inconsistent query tensor layout across layers";
+            *error = "query tensor attention head count does not match model metadata";
+        }
+        return false;
+    }
+    if ((uint32_t) src0->ne[0] != expected.rope_dim) {
+        if (error) {
+            *error = "query tensor rope_dim does not match model metadata";
+        }
+        return false;
+    }
+    if ((uint32_t) rope_params.n_dims != expected.rope_dim) {
+        if (error) {
+            *error = "rope op n_dims does not match model metadata";
+        }
+        return false;
+    }
+    if (rope_style != expected.rope_style) {
+        if (error) {
+            *error = "rope style does not match model metadata";
         }
         return false;
     }
 
-    return true;
-}
-
-bool triattention_calibration_builder::ensure_rope_arrays(
-    const triattention_rope_params & rope_params,
-    std::string * error) {
-    std::vector<float> omega(freq_count_);
-    std::vector<float> freq_scale_sq(freq_count_);
-    if (!triattention_build_rope_arrays(omega.data(), freq_scale_sq.data(), freq_count_, &rope_params)) {
-        if (error) {
-            *error = "failed to derive RoPE frequencies";
-        }
-        return false;
-    }
-
-    if (omega_.empty()) {
-        omega_ = std::move(omega);
-        freq_scale_sq_ = std::move(freq_scale_sq);
-        rope_theta_ = rope_params.freq_base > 0.0f ? rope_params.freq_base : 10000.0f;
-        return true;
-    }
-
-    for (uint32_t i = 0; i < freq_count_; ++i) {
-        if (fabsf(omega_[i] - omega[i]) > 1e-6f || fabsf(freq_scale_sq_[i] - freq_scale_sq[i]) > 1e-6f) {
+    layer_accum & layer = layers_[layer_idx];
+    if (layer.num_attn_heads == 0) {
+        layer.head_dim         = expected.head_dim;
+        layer.rope_dim         = expected.rope_dim;
+        layer.rope_offset      = expected.rope_offset;
+        layer.num_attn_heads   = expected.num_attn_heads;
+        layer.num_kv_heads     = expected.num_kv_heads;
+        layer.num_kv_groups    = expected.num_kv_groups;
+        layer.kv_source_layer  = expected.kv_source_layer;
+        layer.rope_style       = expected.rope_style;
+        layer.freq_count       = expected.freq_count;
+        layer.n_ctx_orig       = expected.n_ctx_orig;
+        layer.rope_theta       = expected.rope_theta;
+        layer.rope_freq_scale  = expected.rope_freq_scale;
+        layer.rope_ext_factor  = expected.rope_ext_factor;
+        layer.rope_attn_factor = expected.rope_attn_factor;
+        layer.rope_beta_fast   = expected.rope_beta_fast;
+        layer.rope_beta_slow   = expected.rope_beta_slow;
+        layer.sum_real.assign((size_t) layer.num_attn_heads * layer.freq_count, 0.0);
+        layer.sum_imag.assign((size_t) layer.num_attn_heads * layer.freq_count, 0.0);
+        layer.sum_abs.assign((size_t) layer.num_attn_heads * layer.freq_count, 0.0);
+        layer.counts.assign(layer.num_attn_heads, 0);
+        layer.omega.resize(layer.freq_count);
+        layer.freq_scale_sq.resize(layer.freq_count);
+        if (!triattention_build_rope_arrays(layer.omega.data(), layer.freq_scale_sq.data(), layer.freq_count, &rope_params)) {
             if (error) {
-                *error = "per-layer rotary frequency variation is not supported by this calibrator";
+                *error = "failed to derive RoPE frequencies";
+            }
+            return false;
+        }
+    } else {
+        if (layer.rope_style != rope_style || layer.rope_dim != (uint32_t) src0->ne[0] ||
+            layer.num_attn_heads != (uint32_t) src0->ne[1]) {
+            if (error) {
+                *error = "inconsistent query tensor layout across captures";
             }
             return false;
         }
@@ -238,39 +249,56 @@ bool triattention_calibration_builder::accumulate_query_tensor(
     uint32_t rope_style,
     const triattention_rope_params & rope_params,
     std::string * error) {
-    if (!ensure_layout(src0, layer_idx, rope_style, error)) {
-        return false;
-    }
-    if (!ensure_rope_arrays(rope_params, error)) {
+    if (!ensure_layout(src0, layer_idx, rope_style, rope_params, error)) {
         return false;
     }
 
+    layer_accum & layer = layers_[layer_idx];
     const uint32_t n_tokens = (uint32_t) src0->ne[2];
-    for (uint32_t head = 0; head < num_attn_heads_; ++head) {
+    for (uint32_t head = 0; head < layer.num_attn_heads; ++head) {
         for (uint32_t tok = 0; tok < n_tokens; ++tok) {
-            for (uint32_t f = 0; f < freq_count_; ++f) {
-                const float re = rope_style_ == 0
+            for (uint32_t f = 0; f < layer.freq_count; ++f) {
+                const float re = layer.rope_style == 0
                     ? triattention_tensor_get_f32(src0, src0_data, f, head, tok, 0)
                     : triattention_tensor_get_f32(src0, src0_data, 2 * f, head, tok, 0);
-                const float im = rope_style_ == 0
-                    ? triattention_tensor_get_f32(src0, src0_data, f + freq_count_, head, tok, 0)
+                const float im = layer.rope_style == 0
+                    ? triattention_tensor_get_f32(src0, src0_data, f + layer.freq_count, head, tok, 0)
                     : triattention_tensor_get_f32(src0, src0_data, 2 * f + 1, head, tok, 0);
 
-                const size_t off = head_offset(layer_idx, head, f);
-                sum_real_[off] += re;
-                sum_imag_[off] += im;
-                sum_abs_[off] += sqrtf(re * re + im * im);
+                const size_t off = head_offset(layer, head, f);
+                layer.sum_real[off] += re;
+                layer.sum_imag[off] += im;
+                layer.sum_abs[off] += sqrtf(re * re + im * im);
             }
 
-            counts_[(size_t) layer_idx * num_attn_heads_ + head] += 1;
+            layer.counts[head] += 1;
         }
     }
 
+    layer.captured = true;
+    return true;
+}
+
+static bool triattention_copy_layer_params_local(
+    triattention_layer_params * dst,
+    const triattention_layer_params * src) {
+    *dst = *src;
+    dst->omega = nullptr;
+    dst->freq_scale_sq = nullptr;
+
+    if (src->freq_count > 0 && src->omega) {
+        dst->omega = new float[src->freq_count];
+        memcpy(dst->omega, src->omega, sizeof(float) * src->freq_count);
+    }
+    if (src->freq_count > 0 && src->freq_scale_sq) {
+        dst->freq_scale_sq = new float[src->freq_count];
+        memcpy(dst->freq_scale_sq, src->freq_scale_sq, sizeof(float) * src->freq_count);
+    }
     return true;
 }
 
 triattention_calibration * triattention_calibration_builder::finalize(std::string * error) const {
-    if (!has_captured_queries()) {
+    if (!model_ || !has_captured_queries()) {
         if (error) {
             *error = "no query rope tensors were captured";
         }
@@ -280,20 +308,63 @@ triattention_calibration * triattention_calibration_builder::finalize(std::strin
     auto * cal = new triattention_calibration();
     memset(cal, 0, sizeof(*cal));
 
-    cal->version        = TRIATTENTION_VERSION;
-    cal->head_dim       = head_dim_;
-    cal->num_layers     = num_layers_;
-    cal->num_attn_heads = num_attn_heads_;
-    cal->num_kv_heads   = num_kv_heads_;
-    cal->num_kv_groups  = num_attn_heads_ / num_kv_heads_;
-    cal->rope_theta     = rope_theta_;
-    cal->rope_style     = rope_style_;
-    cal->freq_count     = freq_count_;
+    cal->version    = TRIATTENTION_VERSION;
+    cal->num_layers = model_->num_layers;
+    cal->layers     = new triattention_layer_params[cal->num_layers];
+    memset(cal->layers, 0, sizeof(triattention_layer_params) * cal->num_layers);
+
+    uint32_t max_head_dim = 0;
+    uint32_t max_rope_dim = 0;
+    uint32_t max_freq_count = 0;
+    uint32_t max_attn_heads = 0;
+    uint32_t max_kv_heads = 0;
+
+    for (uint32_t il = 0; il < model_->num_layers; ++il) {
+        triattention_layer_params layer = model_->layers[il];
+        layer.omega = nullptr;
+        layer.freq_scale_sq = nullptr;
+
+        const layer_accum & acc = layers_[il];
+        if (acc.captured && !acc.omega.empty() && !acc.freq_scale_sq.empty()) {
+            layer.omega = new float[acc.freq_count];
+            layer.freq_scale_sq = new float[acc.freq_count];
+            memcpy(layer.omega, acc.omega.data(), sizeof(float) * acc.freq_count);
+            memcpy(layer.freq_scale_sq, acc.freq_scale_sq.data(), sizeof(float) * acc.freq_count);
+        } else if (model_->layers[il].omega && model_->layers[il].freq_scale_sq) {
+            layer.omega = new float[layer.freq_count];
+            layer.freq_scale_sq = new float[layer.freq_count];
+            memcpy(layer.omega, model_->layers[il].omega, sizeof(float) * layer.freq_count);
+            memcpy(layer.freq_scale_sq, model_->layers[il].freq_scale_sq, sizeof(float) * layer.freq_count);
+        }
+
+        triattention_copy_layer_params_local(&cal->layers[il], &layer);
+        delete[] layer.omega;
+        delete[] layer.freq_scale_sq;
+
+        max_head_dim   = std::max(max_head_dim, cal->layers[il].head_dim);
+        max_rope_dim   = std::max(max_rope_dim, cal->layers[il].rope_dim);
+        max_freq_count = std::max(max_freq_count, cal->layers[il].freq_count);
+        max_attn_heads = std::max(max_attn_heads, cal->layers[il].num_attn_heads);
+        max_kv_heads   = std::max(max_kv_heads, cal->layers[il].num_kv_heads);
+    }
+
+    cal->max_head_dim   = max_head_dim;
+    cal->max_rope_dim   = max_rope_dim;
+    cal->max_freq_count = max_freq_count;
+    cal->head_dim       = max_head_dim;
+    cal->freq_count     = max_freq_count;
+    cal->num_attn_heads = max_attn_heads;
+    cal->num_kv_heads   = max_kv_heads;
+    cal->rope_theta     = cal->num_layers > 0 ? cal->layers[0].rope_theta : 10000.0;
+    cal->rope_style     = cal->num_layers > 0 ? cal->layers[0].rope_style : 0;
+    cal->num_kv_groups  = cal->num_layers > 0 ? cal->layers[0].num_kv_groups : 0;
+    cal->heterogeneous_layout = model_->heterogeneous_layout;
 
     uint32_t n_sampled = 0;
-    for (uint32_t layer = 0; layer < num_layers_; ++layer) {
-        for (uint32_t head = 0; head < num_attn_heads_; ++head) {
-            if (counts_[(size_t) layer * num_attn_heads_ + head] > 0) {
+    for (uint32_t layer = 0; layer < model_->num_layers; ++layer) {
+        const layer_accum & acc = layers_[layer];
+        for (uint32_t head = 0; head < acc.counts.size(); ++head) {
+            if (acc.counts[head] > 0) {
                 ++n_sampled;
             }
         }
@@ -302,10 +373,12 @@ triattention_calibration * triattention_calibration_builder::finalize(std::strin
 
     snprintf(cal->model_name, sizeof(cal->model_name), "%s", model_name_.c_str());
 
-    cal->omega = new float[freq_count_];
-    cal->freq_scale_sq = new float[freq_count_];
-    memcpy(cal->omega, omega_.data(), sizeof(float) * freq_count_);
-    memcpy(cal->freq_scale_sq, freq_scale_sq_.data(), sizeof(float) * freq_count_);
+    if (!cal->heterogeneous_layout && cal->num_layers > 0 && cal->layers[0].omega && cal->layers[0].freq_scale_sq) {
+        cal->omega = new float[cal->layers[0].freq_count];
+        cal->freq_scale_sq = new float[cal->layers[0].freq_count];
+        memcpy(cal->omega, cal->layers[0].omega, sizeof(float) * cal->layers[0].freq_count);
+        memcpy(cal->freq_scale_sq, cal->layers[0].freq_scale_sq, sizeof(float) * cal->layers[0].freq_count);
+    }
 
     cal->sampled_layer = new uint32_t[n_sampled];
     cal->sampled_head  = new uint32_t[n_sampled];
@@ -313,9 +386,14 @@ triattention_calibration * triattention_calibration_builder::finalize(std::strin
     memset(cal->head_stats, 0, sizeof(triattention_head_stats) * n_sampled);
 
     uint32_t out_idx = 0;
-    for (uint32_t layer = 0; layer < num_layers_; ++layer) {
-        for (uint32_t head = 0; head < num_attn_heads_; ++head) {
-            const uint64_t count = counts_[(size_t) layer * num_attn_heads_ + head];
+    for (uint32_t layer = 0; layer < model_->num_layers; ++layer) {
+        const layer_accum & acc = layers_[layer];
+        if (!acc.captured) {
+            continue;
+        }
+
+        for (uint32_t head = 0; head < acc.num_attn_heads; ++head) {
+            const uint64_t count = acc.counts[head];
             if (count == 0) {
                 continue;
             }
@@ -323,18 +401,18 @@ triattention_calibration * triattention_calibration_builder::finalize(std::strin
             cal->sampled_layer[out_idx] = layer;
             cal->sampled_head[out_idx]  = head;
 
-            auto & hs = cal->head_stats[out_idx];
-            hs.q_mean_real = new float[freq_count_];
-            hs.q_mean_imag = new float[freq_count_];
-            hs.q_abs_mean  = new float[freq_count_];
-            hs.r_f         = new float[freq_count_];
+            triattention_head_stats & hs = cal->head_stats[out_idx];
+            hs.q_mean_real = new float[acc.freq_count];
+            hs.q_mean_imag = new float[acc.freq_count];
+            hs.q_abs_mean  = new float[acc.freq_count];
+            hs.r_f         = new float[acc.freq_count];
 
             const double inv_count = 1.0 / (double) count;
-            for (uint32_t f = 0; f < freq_count_; ++f) {
-                const size_t off = head_offset(layer, head, f);
-                const float mean_real = (float) (sum_real_[off] * inv_count);
-                const float mean_imag = (float) (sum_imag_[off] * inv_count);
-                const float abs_mean = (float) (sum_abs_[off] * inv_count);
+            for (uint32_t f = 0; f < acc.freq_count; ++f) {
+                const size_t off = head_offset(acc, head, f);
+                const float mean_real = (float) (acc.sum_real[off] * inv_count);
+                const float mean_imag = (float) (acc.sum_imag[off] * inv_count);
+                const float abs_mean = (float) (acc.sum_abs[off] * inv_count);
                 const float mean_abs = sqrtf(mean_real * mean_real + mean_imag * mean_imag);
 
                 hs.q_mean_real[f] = mean_real;
@@ -351,8 +429,10 @@ triattention_calibration * triattention_calibration_builder::finalize(std::strin
 }
 
 bool triattention_calibration_builder::has_captured_queries() const {
-    return !counts_.empty() && std::any_of(counts_.begin(), counts_.end(), [](uint64_t count) {
-        return count > 0;
+    return std::any_of(layers_.begin(), layers_.end(), [](const layer_accum & layer) {
+        return layer.captured && std::any_of(layer.counts.begin(), layer.counts.end(), [](uint64_t count) {
+            return count > 0;
+        });
     });
 }
 

@@ -3,9 +3,56 @@
 #include "testing.h"
 
 #include <cmath>
+#include <cstring>
 
 static bool approx_equal(float a, float b, float eps = 1e-6f) {
     return std::fabs(a - b) <= eps;
+}
+
+static triattention_model_params make_fallback_model() {
+    triattention_model_params model = {};
+    model.num_layers = 2;
+    model.head_dim = 8;
+    model.rope_dim = 8;
+    model.num_attn_heads = 8;
+    model.num_kv_heads = 2;
+    model.rope_style = 0;
+    model.n_ctx_orig = 128;
+    model.rope_theta = 10000.0;
+    model.rope_freq_scale = 1.0f;
+    model.rope_ext_factor = 0.0f;
+    model.rope_attn_factor = 1.0f;
+    model.rope_beta_fast = 32.0f;
+    model.rope_beta_slow = 1.0f;
+    model.max_head_dim = 8;
+    model.max_rope_dim = 8;
+    model.max_freq_count = 4;
+    model.layers = new triattention_layer_params[2];
+    std::memset(model.layers, 0, sizeof(triattention_layer_params) * 2);
+
+    for (uint32_t il = 0; il < model.num_layers; ++il) {
+        triattention_layer_params & layer = model.layers[il];
+        layer.head_dim = 8;
+        layer.rope_dim = 8;
+        layer.rope_offset = 0;
+        layer.num_attn_heads = 8;
+        layer.num_kv_heads = 2;
+        layer.num_kv_groups = 4;
+        layer.kv_source_layer = il;
+        layer.rope_style = 0;
+        layer.freq_count = 4;
+        layer.n_ctx_orig = 128;
+        layer.rope_theta = 10000.0;
+        layer.rope_freq_scale = 1.0f;
+        layer.rope_ext_factor = 0.0f;
+        layer.rope_attn_factor = 1.0f;
+        layer.rope_beta_fast = 32.0f;
+        layer.rope_beta_slow = 1.0f;
+        layer.omega = new float[4] { 1.0f, 0.5f, 0.25f, 0.125f };
+        layer.freq_scale_sq = new float[4] { 1.0f, 1.0f, 1.0f, 1.0f };
+    }
+
+    return model;
 }
 
 int main() {
@@ -50,13 +97,7 @@ int main() {
     });
 
     t.test("fallback calibration samples representative kv heads", [](testing & t) {
-        triattention_model_params model = {};
-        model.head_dim = 8;
-        model.num_layers = 2;
-        model.num_attn_heads = 8;
-        model.num_kv_heads = 2;
-        model.rope_style = 0;
-        model.rope_theta = 10000.0;
+        triattention_model_params model = make_fallback_model();
 
         triattention_calibration * cal = triattention_calibration_create_fallback(&model);
         t.assert_true(cal != nullptr);
@@ -70,6 +111,7 @@ int main() {
         t.assert_equal((uint32_t) 1, cal->sampled_layer[3]);
         t.assert_equal((uint32_t) 4, cal->sampled_head[3]);
         triattention_calibration_free(cal);
+        triattention_model_params_clear(&model);
     });
 
     return t.summary();

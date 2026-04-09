@@ -429,7 +429,6 @@ static void triattention_dequant_kv_head(
     uint32_t             kv_head_idx,
     uint32_t             n_cells,
     uint32_t             padded_hd,
-    uint32_t             n_kv_heads,
     bool                 need_wht_inv)
 {
     const ggml_type k_type = k_tensor->type;
@@ -508,6 +507,24 @@ static void triattention_dequant_kv_head(
     }
 }
 
+static uint32_t triattention_padded_dim(uint32_t head_dim) {
+    return ((head_dim + 127u) / 128u) * 128u;
+}
+
+static void triattention_extract_rope_slice(
+    float       * out,
+    const float * full_head,
+    uint32_t      n_keys,
+    uint32_t      full_head_dim,
+    uint32_t      rope_offset,
+    uint32_t      rope_dim) {
+    for (uint32_t i = 0; i < n_keys; ++i) {
+        memcpy(out + (size_t) i * rope_dim,
+               full_head + (size_t) i * full_head_dim + rope_offset,
+               sizeof(float) * rope_dim);
+    }
+}
+
 // ============================================================================
 // Public API: Init / Free
 // ============================================================================
@@ -515,22 +532,30 @@ static void triattention_dequant_kv_head(
 triattention_state * triattention_init(
     const char * stats_path,
     const triattention_config * cfg,
-    const triattention_model_params * model)
+    const triattention_model_params * model,
+    const uint32_t * sampled_layers,
+    uint32_t n_sampled_layers)
 {
     if (!cfg || !model) {
         return nullptr;
     }
 
+    triattention_calibration * full_cal = nullptr;
     triattention_calibration * cal = nullptr;
     bool fallback_active = false;
 
     if (stats_path && stats_path[0] != '\0') {
-        cal = triattention_calibration_load(stats_path);
-        if (!cal) {
+        full_cal = triattention_calibration_load(stats_path);
+        if (!full_cal) {
             return nullptr;
         }
-        if (!triattention_calibration_validate(cal, model, true)) {
-            triattention_calibration_free(cal);
+        if (!triattention_calibration_validate(full_cal, model, true)) {
+            triattention_calibration_free(full_cal);
+            return nullptr;
+        }
+        cal = triattention_calibration_subset(full_cal, sampled_layers, n_sampled_layers);
+        triattention_calibration_free(full_cal);
+        if (!cal) {
             return nullptr;
         }
     } else {
@@ -544,7 +569,7 @@ triattention_state * triattention_init(
             return nullptr;
         }
 
-        cal = triattention_calibration_create_fallback(model);
+        cal = triattention_calibration_create_fallback(model, sampled_layers, n_sampled_layers);
         if (!cal) {
             fprintf(stderr, "[TriAttention] ERROR: failed to construct runtime fallback state\n");
             return nullptr;
@@ -559,41 +584,44 @@ triattention_state * triattention_init(
     state->cal = cal;
     state->cfg = *cfg;
     state->cfg.fallback_recency_weight = fminf(1.0f, fmaxf(0.0f, state->cfg.fallback_recency_weight));
-    state->model = *model;
+    state->model = {};
+    state->model.kv_size = model->kv_size;
+    state->model.num_layers = model->num_layers;
+    state->model.head_dim = model->head_dim;
+    state->model.rope_dim = model->rope_dim;
+    state->model.num_attn_heads = model->num_attn_heads;
+    state->model.num_kv_heads = model->num_kv_heads;
+    state->model.rope_style = model->rope_style;
+    state->model.n_ctx_orig = model->n_ctx_orig;
+    state->model.rope_theta = model->rope_theta;
+    state->model.rope_freq_scale = model->rope_freq_scale;
+    state->model.rope_ext_factor = model->rope_ext_factor;
+    state->model.rope_attn_factor = model->rope_attn_factor;
+    state->model.rope_beta_fast = model->rope_beta_fast;
+    state->model.rope_beta_slow = model->rope_beta_slow;
     state->fallback_active = fallback_active;
     state->kv_size = model->kv_size;
     state->absolute_position = 0;
     state->prefix_length     = 0;
 
-    const uint32_t fc = cal->freq_count;
-    const uint32_t hd = cal->head_dim;
+    for (uint32_t il = 0; il < cal->num_layers; ++il) {
+        triattention_layer_params & cal_layer = cal->layers[il];
+        const triattention_layer_params & model_layer = model->layers[il];
+        cal_layer.kv_source_layer = model_layer.kv_source_layer;
 
-    state->omega = new float[fc];
-    state->freq_scale_sq = new float[fc];
-    if (cal->omega && cal->freq_scale_sq) {
-        memcpy(state->omega, cal->omega, sizeof(float) * fc);
-        memcpy(state->freq_scale_sq, cal->freq_scale_sq, sizeof(float) * fc);
-    } else {
-        triattention_rope_params rope_params = {
-            /*.n_dims            =*/ hd,
-            /*.n_ctx_orig        =*/ model->n_ctx_orig,
-            /*.freq_base         =*/ (float) model->rope_theta,
-            /*.freq_scale        =*/ model->rope_freq_scale,
-            /*.ext_factor        =*/ model->rope_ext_factor,
-            /*.attn_factor       =*/ model->rope_attn_factor,
-            /*.beta_fast         =*/ model->rope_beta_fast,
-            /*.beta_slow         =*/ model->rope_beta_slow,
-            /*.freq_factors      =*/ nullptr,
-            /*.freq_factor_count =*/ 0,
-        };
-
-        if (!triattention_build_rope_arrays(state->omega, state->freq_scale_sq, fc, &rope_params)) {
-            for (uint32_t f = 0; f < fc; ++f) {
-                const double exponent = -2.0 * (double) f / (double) hd;
-                state->omega[f] = (float) pow(model->rope_theta, exponent);
-                state->freq_scale_sq[f] = 1.0f;
-            }
+        if ((!cal_layer.omega || !cal_layer.freq_scale_sq) && model_layer.omega && model_layer.freq_scale_sq) {
+            delete[] cal_layer.omega;
+            delete[] cal_layer.freq_scale_sq;
+            cal_layer.omega = new float[model_layer.freq_count];
+            cal_layer.freq_scale_sq = new float[model_layer.freq_count];
+            memcpy(cal_layer.omega, model_layer.omega, sizeof(float) * model_layer.freq_count);
+            memcpy(cal_layer.freq_scale_sq, model_layer.freq_scale_sq, sizeof(float) * model_layer.freq_count);
         }
+
+        state->max_head_dim       = std::max(state->max_head_dim, cal_layer.head_dim);
+        state->max_rope_dim       = std::max(state->max_rope_dim, cal_layer.rope_dim);
+        state->max_freq_count     = std::max(state->max_freq_count, cal_layer.freq_count);
+        state->max_padded_head_dim = std::max(state->max_padded_head_dim, triattention_padded_dim(cal_layer.head_dim));
     }
 
     // Geometric offsets — max 17 elements for offset_max=65536
@@ -603,7 +631,8 @@ triattention_state * triattention_init(
     // Precompute derived head stats
     if (!fallback_active) {
         for (uint32_t h = 0; h < cal->n_sampled; h++) {
-            triattention_precompute_head_derived(&cal->head_stats[h], fc, cfg->disable_mlr);
+            const uint32_t layer_idx = cal->sampled_layer[h];
+            triattention_precompute_head_derived(&cal->head_stats[h], cal->layers[layer_idx].freq_count, cfg->disable_mlr);
         }
     }
 
@@ -615,8 +644,9 @@ triattention_state * triattention_init(
 
     // Allocate scratch buffers
     // These are sized for worst-case (scoring all cells)
-    state->dequant_buf  = new float[(size_t)state->kv_size * hd];
-    state->unrot_buf    = new float[(size_t)state->kv_size * hd];
+    state->dequant_buf  = new float[(size_t) state->kv_size * state->max_padded_head_dim];
+    state->rope_buf     = new float[(size_t) state->kv_size * state->max_rope_dim];
+    state->unrot_buf    = new float[(size_t) state->kv_size * state->max_rope_dim];
     state->score_buf    = new float[(size_t)cal->n_sampled * state->kv_size];
     state->combined_buf = new float[state->kv_size];
     state->keep_indices = new uint32_t[cfg->budget];
@@ -640,12 +670,12 @@ void triattention_free(triattention_state * state) {
     if (!state) return;
 
     triattention_calibration_free(state->cal);
+    triattention_model_params_clear(&state->model);
 
-    delete[] state->omega;
-    delete[] state->freq_scale_sq;
     delete[] state->offsets;
     delete[] state->cell_positions;
     delete[] state->dequant_buf;
+    delete[] state->rope_buf;
     delete[] state->unrot_buf;
     delete[] state->score_buf;
     delete[] state->combined_buf;
@@ -836,11 +866,19 @@ static void triattention_init_gpu(triattention_state * state, ggml_type k_type) 
 
     const triattention_calibration * cal = state->cal;
     const triattention_config & cfg = state->cfg;
+    if (!cal || cal->num_layers == 0 || cal->heterogeneous_layout) {
+        return;
+    }
+
+    const triattention_layer_params & layer0 = cal->layers[0];
+    if (layer0.rope_offset != 0 || !layer0.omega || !layer0.freq_scale_sq) {
+        return;
+    }
 
     triattention_gpu_config gcfg = {};
-    gcfg.head_dim     = cal->head_dim;
-    gcfg.freq_count   = cal->freq_count;
-    gcfg.n_kv_heads   = cal->num_kv_heads;
+    gcfg.head_dim     = layer0.rope_dim;
+    gcfg.freq_count   = layer0.freq_count;
+    gcfg.n_kv_heads   = layer0.num_kv_heads;
     gcfg.n_sampled    = cal->n_sampled;
     gcfg.n_offsets    = state->n_offsets;
     gcfg.k_type       = k_type;
@@ -857,7 +895,7 @@ static void triattention_init_gpu(triattention_state * state, ggml_type k_type) 
 
     auto * gpu_st = triattention_gpu_init(
         &gcfg, gcalibs.data(),
-        state->omega, state->freq_scale_sq, state->offsets, nullptr);
+        layer0.omega, layer0.freq_scale_sq, state->offsets, nullptr);
     if (!gpu_st) {
         fprintf(stderr, "[TriAttention] GPU init failed, using CPU scoring\n");
         return;
@@ -883,126 +921,8 @@ int32_t triattention_prune(
     triattention_state * state,
     llama_kv_cache     * kv)
 {
-    if (!state || !kv) return -1;
-
-    double t_start = triattention_time_ms();
-
-    const auto & cfg = state->cfg;
-    const auto * cal = state->cal;
-    const uint32_t fc = cal->freq_count;
-    const uint32_t hd = cal->head_dim;
-    // Padded head dim for turbo types (always 128-aligned)
-    const uint32_t padded_hd = ((hd + 127) / 128) * 128;
-
-    const uint32_t kv_size = state->kv_size;
-    const uint32_t budget  = cfg.budget;
-
-    // ---- Step 1: Enumerate occupied cells ----
-    // Build lists of occupied cell indices and their positions
-    std::vector<uint32_t> occupied_indices;
-    std::vector<int32_t>  occupied_positions;
-    occupied_indices.reserve(kv_size);
-    occupied_positions.reserve(kv_size);
-
-    for (uint32_t i = 0; i < kv_size; i++) {
-        if (state->cell_positions[i] >= 0) {
-            occupied_indices.push_back(i);
-            occupied_positions.push_back(state->cell_positions[i]);
-        }
-    }
-
-    const uint32_t n_occupied = (uint32_t)occupied_indices.size();
-    if (n_occupied <= budget) {
-        // Nothing to prune
-        return 0;
-    }
-
-    // ---- Step 2: Separate prefix from decode tokens ----
-    // If protect_prefill is on, prefix tokens are always kept
-    std::vector<uint32_t> decode_indices;
-    std::vector<int32_t>  decode_positions;
-    std::vector<uint32_t> prefix_indices;
-
-    if (cfg.protect_prefill && state->prefix_length > 0) {
-        for (uint32_t i = 0; i < n_occupied; i++) {
-            if (occupied_positions[i] < (int32_t)state->prefix_length) {
-                prefix_indices.push_back(i);  // index into occupied arrays
-            } else {
-                decode_indices.push_back(occupied_indices[i]);
-                decode_positions.push_back(occupied_positions[i]);
-            }
-        }
-    } else {
-        decode_indices = occupied_indices;
-        decode_positions = occupied_positions;
-    }
-
-    const uint32_t n_prefix = (uint32_t)prefix_indices.size();
-    const uint32_t n_decode = (uint32_t)decode_indices.size();
-
-    // Effective budget for decode tokens (subtract protected prefix)
-    const uint32_t decode_budget = (budget > n_prefix) ? (budget - n_prefix) : 0;
-
-    if (n_decode <= decode_budget) {
-        return 0;  // Prefix + decode already within budget
-    }
-
-    // ---- Step 3: Score keys for each sampled (layer, head) ----
-    // For each sampled head, dequantize K data, invert RoPE, and compute scores
-
-    // Determine which cache layers exist
-    // The KV cache has map_layer_ids mapping model layer → internal layer index
-    // We access K tensors via the public get_k() interface, but that requires
-    // a ggml_context. For direct tensor access, we use the cache's internal layers.
-
-    // Get K tensor type from the first layer (assume uniform type)
-    // We access the cache's layers array through the public interface
-    const uint32_t n_kv_heads = cal->num_kv_heads;
-
-    // Determine if inverse WHT is needed for this cache type
-    // turbo2_0, turbo3_0: dequant output is in WHT-rotated space → need R^T
-    // turbo4_0: dequant already applies R^T → no additional rotation needed
-    // Others (Q8_0, F16, F32): no WHT rotation at all
-    // We'll detect this per-layer from the tensor type
-
-    for (uint32_t sh = 0; sh < cal->n_sampled; sh++) {
-        const uint32_t layer_idx = cal->sampled_layer[sh];
-        const uint32_t attn_head = cal->sampled_head[sh];
-        const uint32_t kv_head   = attn_head / cal->num_kv_groups;
-
-        // Get K tensor for this layer
-        // We need direct access to the cache's internal K tensor.
-        // The get_k() method requires ggml_context which we don't have here.
-        // Instead, we use ggml_backend_tensor_get() on the raw cache tensor.
-        //
-        // Access pattern: the tensor is k_l[layer] with shape:
-        //   ne[0] = n_embd_k_gqa (= n_kv_heads * padded_head_dim)
-        //   ne[1] = kv_size
-        //   ne[2] = n_stream (usually 1)
-        //
-        // For TriAttention we pass the K tensor pointer through the KV cache.
-        // This requires a minor modification to llama_kv_cache to expose it.
-        // For now, we assume the KV cache provides a get_k_tensor() method.
-
-        // TODO: Replace with actual K tensor access once KV cache is modified
-        // For now, this function requires that the k_tensor is passed in separately.
-        // The integration code in llama-kv-cache.cpp will call this with the right tensor.
-        (void)layer_idx;
-        (void)kv_head;
-
-        // Score computations are done in the triattention_prune_with_tensors() function below
-        (void)sh;
-    }
-
-    // This function serves as the public entry point.
-    // The actual implementation that takes tensor pointers is in triattention_prune_impl().
-    // The KV cache integration code calls triattention_prune_impl() with the tensor array.
-
-    // For the public API, return 0 (the real work is in prune_impl called from kv-cache.cpp)
-    double t_end = triattention_time_ms();
-    state->last_prune_time_ms = t_end - t_start;
-
-    return 0;
+    GGML_UNUSED(kv);
+    return state ? 0 : -1;
 }
 
 // ============================================================================
@@ -1026,7 +946,7 @@ int32_t triattention_prune_impl(
     triattention_state * state,
     ggml_tensor * const * k_tensors,
     uint32_t              n_layers,
-    const int32_t       * layer_map,
+    const int32_t       * layer_to_cache,
     uint32_t              kv_size)
 {
     if (!state) return -1;
@@ -1035,9 +955,6 @@ int32_t triattention_prune_impl(
 
     const auto & cfg = state->cfg;
     const auto * cal = state->cal;
-    const uint32_t fc = cal->freq_count;
-    const uint32_t hd = cal->head_dim;
-    const uint32_t padded_hd = ((hd + 127) / 128) * 128;
     const uint32_t budget = cfg.budget;
 
     // ---- Step 1: Enumerate occupied cells ----
@@ -1130,13 +1047,11 @@ int32_t triattention_prune_impl(
         for (uint32_t sh = 0; sh < cal->n_sampled; sh++) {
             const uint32_t layer_idx = cal->sampled_layer[sh];
             const uint32_t attn_head = cal->sampled_head[sh];
-            const uint32_t kv_head   = attn_head / cal->num_kv_groups;
+            const triattention_layer_params & layer = cal->layers[layer_idx];
+            const uint32_t kv_source = layer.kv_source_layer;
+            const uint32_t kv_head   = layer.num_kv_groups > 0 ? attn_head / layer.num_kv_groups : 0;
 
-            // Find internal layer index
-            int32_t ikv = -1;
-            for (uint32_t l = 0; l < n_layers; l++) {
-                if (layer_map[l] == (int32_t)layer_idx) { ikv = (int32_t)l; break; }
-            }
+            int32_t ikv = (kv_source < cal->num_layers) ? layer_to_cache[kv_source] : -1;
             if (ikv < 0) {
                 // Layer not in cache — will zero out after copy
                 continue;
@@ -1170,10 +1085,9 @@ int32_t triattention_prune_impl(
         // Zero out scores for heads whose layers were not in cache
         for (uint32_t sh = 0; sh < cal->n_sampled; sh++) {
             const uint32_t layer_idx = cal->sampled_layer[sh];
-            int32_t ikv = -1;
-            for (uint32_t l = 0; l < n_layers; l++) {
-                if (layer_map[l] == (int32_t)layer_idx) { ikv = (int32_t)l; break; }
-            }
+            const triattention_layer_params & layer = cal->layers[layer_idx];
+            const uint32_t kv_source = layer.kv_source_layer;
+            int32_t ikv = (kv_source < cal->num_layers) ? layer_to_cache[kv_source] : -1;
             if (ikv < 0) {
                 memset(score_buf + (size_t)sh * n_decode, 0, n_decode * sizeof(float));
             }
@@ -1188,18 +1102,17 @@ int32_t triattention_prune_impl(
         for (uint32_t sh = 0; sh < cal->n_sampled; sh++) {
             const uint32_t layer_idx = cal->sampled_layer[sh];
             const uint32_t attn_head = cal->sampled_head[sh];
-            const uint32_t kv_head   = attn_head / cal->num_kv_groups;
+            const triattention_layer_params & layer = cal->layers[layer_idx];
+            const uint32_t kv_source = layer.kv_source_layer;
+            const uint32_t kv_head   = layer.num_kv_groups > 0 ? attn_head / layer.num_kv_groups : 0;
 
-            // Find internal layer id
-            int32_t ikv = -1;
-            for (uint32_t l = 0; l < n_layers; l++) {
-                if (layer_map[l] == (int32_t)layer_idx) {
-                    ikv = (int32_t)l;
-                    break;
-                }
-            }
+            int32_t ikv = (kv_source < cal->num_layers) ? layer_to_cache[kv_source] : -1;
             if (ikv < 0) {
                 // Layer not in cache (filtered out) — zero scores
+                memset(score_buf + (size_t)sh * n_decode, 0, n_decode * sizeof(float));
+                continue;
+            }
+            if (kv_head >= layer.num_kv_heads) {
                 memset(score_buf + (size_t)sh * n_decode, 0, n_decode * sizeof(float));
                 continue;
             }
@@ -1207,6 +1120,7 @@ int32_t triattention_prune_impl(
             const ggml_tensor * k_tensor = k_tensors[ikv];
             const ggml_type k_type_l = k_tensor->type;
             const bool need_wht_inv = (k_type_l == GGML_TYPE_TURBO2_0 || k_type_l == GGML_TYPE_TURBO3_0);
+            const uint32_t padded_hd = triattention_padded_dim(layer.head_dim);
 
             // 3a. Dequantize K for this KV head for all decode cells
             triattention_dequant_kv_head(
@@ -1216,42 +1130,50 @@ int32_t triattention_prune_impl(
                 kv_head,
                 n_decode,
                 padded_hd,
-                cal->num_kv_heads,
                 need_wht_inv);
 
-            // 3b. Invert RoPE → pre-RoPE K
-            triattention_invert_rope(
-                state->unrot_buf,
+            // 3b. Extract the rotary-tracked slice used by TriAttention.
+            triattention_extract_rope_slice(
+                state->rope_buf,
                 state->dequant_buf,
-                decode_positions.data(),
-                state->omega,
                 n_decode,
                 padded_hd,
-                fc,
-                cal->rope_style);
+                layer.rope_offset,
+                layer.rope_dim);
 
-            // 3c. Score keys
+            // 3c. Invert RoPE → pre-RoPE K
+            triattention_invert_rope(
+                state->unrot_buf,
+                state->rope_buf,
+                decode_positions.data(),
+                layer.omega,
+                n_decode,
+                layer.rope_dim,
+                layer.freq_count,
+                layer.rope_style);
+
+            // 3d. Score keys
             if (state->fallback_active) {
                 triattention_score_keys_norm(
                     score_buf + (size_t)sh * n_decode,
                     state->unrot_buf,
-                    state->freq_scale_sq,
+                    layer.freq_scale_sq,
                     n_decode,
-                    padded_hd,
-                    fc);
+                    layer.rope_dim,
+                    layer.freq_count);
             } else {
                 triattention_score_keys(
                     score_buf + (size_t)sh * n_decode,
                     state->unrot_buf,
                     &cal->head_stats[sh],
-                    state->omega,
-                    state->freq_scale_sq,
+                    layer.omega,
+                    layer.freq_scale_sq,
                     state->offsets,
                     decode_positions.data(),
                     state->absolute_position,
                     n_decode,
-                    padded_hd,
-                    fc,
+                    layer.rope_dim,
+                    layer.freq_count,
                     state->n_offsets,
                     cfg.agg,
                     cfg.disable_trig);
@@ -1318,23 +1240,33 @@ int32_t triattention_prune_impl(
 
     } else if (cfg.mode == TRIATTENTION_MODE_PER_KV_HEAD) {
         // ---- Per-KV-head independent selection ----
-        // Group sampled attention heads by KV head.
-        // For each KV head: aggregate scores across layers → independent top-B
+        // Group sampled attention heads by KV head. For heterogeneous layouts
+        // we fall back to per-(layer,kv_head) grouping because cross-layer KV
+        // head identities are not comparable.
+        std::vector<uint64_t> group_keys;
+        std::vector<std::vector<uint32_t>> kv_head_to_sampled;
+        for (uint32_t sh = 0; sh < cal->n_sampled; ++sh) {
+            const uint32_t layer_idx = cal->sampled_layer[sh];
+            const triattention_layer_params & layer = cal->layers[layer_idx];
+            const uint32_t kv_h = layer.num_kv_groups > 0 ? cal->sampled_head[sh] / layer.num_kv_groups : 0;
+            const uint64_t key = cal->heterogeneous_layout
+                ? ((uint64_t) layer_idx << 32) | kv_h
+                : (uint64_t) kv_h;
 
-        const uint32_t n_kv = cal->num_kv_heads;
-        std::vector<std::vector<uint32_t>> kv_head_to_sampled(n_kv);
-
-        for (uint32_t sh = 0; sh < cal->n_sampled; sh++) {
-            uint32_t kv_h = cal->sampled_head[sh] / cal->num_kv_groups;
-            kv_head_to_sampled[kv_h].push_back(sh);
+            auto it = std::find(group_keys.begin(), group_keys.end(), key);
+            if (it == group_keys.end()) {
+                group_keys.push_back(key);
+                kv_head_to_sampled.push_back({ sh });
+            } else {
+                kv_head_to_sampled[(size_t) (it - group_keys.begin())].push_back(sh);
+            }
         }
 
         // For each decode token: max score across all KV heads
         // (simplified: we use the per-KV-head max as the combined score)
         for (uint32_t i = 0; i < n_decode; i++) combined[i] = -1e30f;
 
-        for (uint32_t kv_h = 0; kv_h < n_kv; kv_h++) {
-            const auto & heads = kv_head_to_sampled[kv_h];
+        for (const auto & heads : kv_head_to_sampled) {
             if (heads.empty()) continue;
 
             for (uint32_t i = 0; i < n_decode; i++) {

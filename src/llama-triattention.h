@@ -27,21 +27,45 @@ struct llama_hparams;
 //
 // Header:
 //   magic          uint32  0x54524941 ("TRIA")
-//   version        uint32  1 or 2
-//   head_dim       uint32  e.g. 128
+//   version        uint32  1, 2, or 3
+//   head_dim       uint32  legacy / compatibility field
 //   num_layers     uint32  e.g. 36
-//   num_attn_heads uint32  e.g. 36  (total attention heads, not KV heads)
-//   num_kv_heads   uint32  e.g. 4   (grouped query attention KV heads)
-//   rope_theta     float64 e.g. 10000.0
-//   rope_style     uint32  0=half, 1=interleaved
+//   num_attn_heads uint32  legacy / compatibility field
+//   num_kv_heads   uint32  legacy / compatibility field
+//   rope_theta     float64 legacy / compatibility field
+//   rope_style     uint32  legacy / compatibility field
 //   n_sampled      uint32  number of (layer, head) pairs with stats
-//   freq_count     uint32  head_dim / 2
+//   freq_count     uint32  legacy / compatibility field
 //   name_len       uint32  length of model name string (including null)
 //   name           char[name_len]  UTF-8 null-terminated model name
 //
 // Version 2 adds:
 //   omega          float32[freq_count]
 //   freq_scale_sq  float32[freq_count]
+//
+// Version 3 adds per-layer geometry and rotary metadata so heterogeneous
+// models (e.g. Gemma 4 / iSWA, mixed-SWA, variable KV-grouping) can be
+// calibrated and validated faithfully:
+//   layer_count    uint32  == num_layers
+//   per-layer:
+//     head_dim       uint32  full cached K head dimension
+//     rope_dim       uint32  rotary-tracked sub-dimension
+//     rope_offset    uint32  start of the rotary slice within the full head
+//     num_attn_heads uint32
+//     num_kv_heads   uint32
+//     rope_style     uint32  0=half, 1=interleaved
+//     n_ctx_orig     uint32
+//     rope_theta     float64
+//     rope_freq_scale float32
+//     rope_ext_factor float32
+//     rope_attn_factor float32
+//     rope_beta_fast float32
+//     rope_beta_slow float32
+//     freq_count     uint32  = rope_dim / 2
+//     has_explicit_rope uint32 (0/1)
+//     if has_explicit_rope:
+//       omega         float32[freq_count]
+//       freq_scale_sq float32[freq_count]
 //
 // Per sampled head (repeated n_sampled times):
 //   layer_idx      uint32
@@ -52,7 +76,7 @@ struct llama_hparams;
 //   r_f            float32[freq_count]  ||E[q_f]|| / E[||q_f||] (validation)
 
 #define TRIATTENTION_MAGIC   0x54524941u  // "TRIA" in little-endian
-#define TRIATTENTION_VERSION 2u
+#define TRIATTENTION_VERSION 3u
 
 // ============================================================================
 // Enums
@@ -118,21 +142,53 @@ struct triattention_head_stats {
     float * extra_weight;   // [freq_count]  E[||q_f||] - ||E[q_f]|| (norm excess, MLR-weighted)
 };
 
+// Per-layer geometry and rotary metadata.
+// head_dim is the full cached key dimension for that layer.
+// rope_dim/rope_offset define the rotary-tracked subspace used by TriAttention.
+struct triattention_layer_params {
+    uint32_t head_dim;
+    uint32_t rope_dim;
+    uint32_t rope_offset;
+    uint32_t num_attn_heads;
+    uint32_t num_kv_heads;
+    uint32_t num_kv_groups;
+    uint32_t kv_source_layer;     // model layer whose K/V cache geometry this layer scores against
+    uint32_t rope_style;          // 0 = half, 1 = interleaved
+    uint32_t freq_count;          // = rope_dim / 2
+    uint32_t n_ctx_orig;
+
+    double rope_theta;
+    float  rope_freq_scale;
+    float  rope_ext_factor;
+    float  rope_attn_factor;
+    float  rope_beta_fast;
+    float  rope_beta_slow;
+
+    float * omega;                // [freq_count] optional explicit RoPE angular frequencies
+    float * freq_scale_sq;        // [freq_count] optional explicit RoPE magnitude scaling^2
+};
+
 // Model calibration data loaded from .triattention file
 struct triattention_calibration {
     uint32_t version;
-    uint32_t head_dim;
+    uint32_t head_dim;            // compatibility summary (max across layers for v3)
     uint32_t num_layers;
-    uint32_t num_attn_heads;      // total attention heads
-    uint32_t num_kv_heads;        // GQA KV heads
-    uint32_t num_kv_groups;       // = num_attn_heads / num_kv_heads
-    double   rope_theta;
-    uint32_t rope_style;          // 0 = half, 1 = interleaved
-    uint32_t freq_count;          // = head_dim / 2
+    uint32_t num_attn_heads;      // compatibility summary (max across layers for v3)
+    uint32_t num_kv_heads;        // compatibility summary (max across layers for v3)
+    uint32_t num_kv_groups;       // compatibility summary (0 when heterogeneous)
+    double   rope_theta;          // compatibility summary
+    uint32_t rope_style;          // compatibility summary (layer 0 / uniform)
+    uint32_t freq_count;          // compatibility summary (max across layers for v3)
     uint32_t n_sampled;           // number of (layer, head) pairs
 
-    float * omega;                // [freq_count]  explicit RoPE angular frequencies (v2)
-    float * freq_scale_sq;        // [freq_count]  explicit RoPE magnitude scaling^2 (v2)
+    float * omega;                // [freq_count] legacy explicit RoPE angular frequencies (v2 / uniform v3)
+    float * freq_scale_sq;        // [freq_count] legacy explicit RoPE magnitude scaling^2 (v2 / uniform v3)
+
+    triattention_layer_params * layers; // [num_layers]
+    uint32_t max_head_dim;
+    uint32_t max_rope_dim;
+    uint32_t max_freq_count;
+    bool heterogeneous_layout;
 
     // Per sampled head arrays — length n_sampled
     uint32_t * sampled_layer;     // [n_sampled]  layer index
@@ -145,19 +201,27 @@ struct triattention_calibration {
 // Model/runtime parameters needed to build fallback state and validate calibration.
 struct triattention_model_params {
     uint32_t kv_size;
-    uint32_t head_dim;
     uint32_t num_layers;
-    uint32_t num_attn_heads;
-    uint32_t num_kv_heads;
-    uint32_t rope_style;          // 0 = half, 1 = interleaved
-    uint32_t n_ctx_orig;
 
-    double rope_theta;
-    float  rope_freq_scale;
-    float  rope_ext_factor;
-    float  rope_attn_factor;
-    float  rope_beta_fast;
-    float  rope_beta_slow;
+    uint32_t head_dim;            // compatibility summary (max across layers)
+    uint32_t rope_dim;            // compatibility summary (max across layers)
+    uint32_t num_attn_heads;      // compatibility summary (max across layers)
+    uint32_t num_kv_heads;        // compatibility summary (max across layers)
+    uint32_t rope_style;          // compatibility summary
+    uint32_t n_ctx_orig;          // compatibility summary
+
+    double rope_theta;            // compatibility summary
+    float  rope_freq_scale;       // compatibility summary
+    float  rope_ext_factor;       // compatibility summary
+    float  rope_attn_factor;      // compatibility summary
+    float  rope_beta_fast;        // compatibility summary
+    float  rope_beta_slow;        // compatibility summary
+
+    triattention_layer_params * layers; // [num_layers]
+    uint32_t max_head_dim;
+    uint32_t max_rope_dim;
+    uint32_t max_freq_count;
+    bool heterogeneous_layout;
 };
 
 // Runtime configuration — set from CLI args, immutable after init
@@ -187,6 +251,10 @@ struct triattention_state {
     triattention_calibration * cal;
     triattention_config cfg;
     triattention_model_params model;
+    uint32_t max_head_dim;
+    uint32_t max_rope_dim;
+    uint32_t max_padded_head_dim;
+    uint32_t max_freq_count;
     bool fallback_active;
 
     // Inference tracking
@@ -195,8 +263,6 @@ struct triattention_state {
     uint32_t kv_size;             // Total KV cache capacity (from cache init)
 
     // Precomputed arrays (allocated once at init)
-    float *   omega;              // [freq_count]  RoPE frequencies: theta^(-2f/d)
-    float *   freq_scale_sq;      // [freq_count]  frequency scaling^2
     float *   offsets;            // [n_offsets]   geometric {1,2,4,...,offset_max}
     uint32_t  n_offsets;
 
@@ -207,8 +273,9 @@ struct triattention_state {
     int32_t * cell_positions;     // [kv_size]  absolute position per cell (-1 = empty)
 
     // Scratch buffers (allocated once, reused every prune call)
-    float *    dequant_buf;       // [kv_size * head_dim]  dequantized K values
-    float *    unrot_buf;         // [kv_size * head_dim]  pre-RoPE K after inversion
+    float *    dequant_buf;       // [kv_size * max_padded_head_dim]  dequantized full K heads
+    float *    rope_buf;          // [kv_size * max_rope_dim]  extracted rotary slice
+    float *    unrot_buf;         // [kv_size * max_rope_dim]  pre-RoPE K after inversion
     float *    score_buf;         // [n_sampled * kv_size]  per-head scores
     float *    combined_buf;      // [kv_size]  final combined scores
     uint32_t * keep_indices;      // [budget]   indices to retain
@@ -248,7 +315,9 @@ extern "C" {
 triattention_state * triattention_init(
     const char * stats_path,
     const triattention_config * cfg,
-    const triattention_model_params * model);
+    const triattention_model_params * model,
+    const uint32_t * sampled_layers,
+    uint32_t n_sampled_layers);
 
 // Free all memory associated with a TriAttention state.
 // Safe to call with nullptr.
@@ -447,5 +516,5 @@ int32_t triattention_prune_impl(
     triattention_state * state,
     ggml_tensor * const * k_tensors,
     uint32_t              n_layers,
-    const int32_t       * layer_map,
+    const int32_t       * layer_to_cache,
     uint32_t              kv_size);

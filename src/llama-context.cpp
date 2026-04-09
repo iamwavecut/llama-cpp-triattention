@@ -3371,12 +3371,6 @@ int32_t llama_triattention_init(
         return -1;
     }
 
-    auto * kv = dynamic_cast<llama_kv_cache *>(mem);
-    if (!kv) {
-        LLAMA_LOG_ERROR("%s: memory is not a KV cache (recurrent models not supported)\n", __func__);
-        return -1;
-    }
-
     triattention_config cfg = {};
     cfg.budget           = (uint32_t)budget;
     cfg.divide_length    = (uint32_t)divide_length;
@@ -3394,42 +3388,10 @@ int32_t llama_triattention_init(
     cfg.fallback_recency_weight = fallback_recency_weight;
 
     const llama_model & model = ctx->get_model();
-    const llama_hparams & hparams = model.hparams;
     const llama_cparams & cparams = ctx->get_cparams();
 
-    uint32_t rope_style = 0;
-    switch (llama_model_rope_type(&model)) {
-        case LLAMA_ROPE_TYPE_NORM:
-            rope_style = 1;
-            break;
-        case LLAMA_ROPE_TYPE_NEOX:
-        case LLAMA_ROPE_TYPE_MROPE:
-        case LLAMA_ROPE_TYPE_IMROPE:
-            rope_style = 0;
-            break;
-        default:
-            LLAMA_LOG_ERROR("%s: unsupported rope type %d for TriAttention\n",
-                    __func__, (int) llama_model_rope_type(&model));
-            return -1;
-    }
-
-    triattention_model_params model_params = {};
-    model_params.kv_size           = kv->get_size();
-    model_params.head_dim          = hparams.n_embd_head_k(0);
-    model_params.num_layers        = hparams.n_layer;
-    model_params.num_attn_heads    = hparams.n_head(0);
-    model_params.num_kv_heads      = hparams.n_head_kv(0);
-    model_params.rope_style        = rope_style;
-    model_params.n_ctx_orig        = hparams.n_ctx_orig_yarn;
-    model_params.rope_theta        = (double) cparams.rope_freq_base;
-    model_params.rope_freq_scale   = cparams.rope_freq_scale;
-    model_params.rope_ext_factor   = cparams.yarn_ext_factor;
-    model_params.rope_attn_factor  = cparams.yarn_attn_factor;
-    model_params.rope_beta_fast    = cparams.yarn_beta_fast;
-    model_params.rope_beta_slow    = cparams.yarn_beta_slow;
-
-    kv->init_triattention(stats_path, &cfg, &model_params);
-    return kv->has_triattention() ? 0 : -1;
+    const int32_t rc = mem->triattention_init_from_model(model, cparams, stats_path, &cfg);
+    return (rc == 0 && mem->triattention_is_active()) ? 0 : -1;
 }
 
 // llama state API

@@ -192,6 +192,18 @@ void llama_memory_hybrid_iswa::state_read(llama_io_read_i & io, llama_seq_id seq
     mem_recr->state_read(io, seq_id, flags);
 }
 
+int32_t llama_memory_hybrid_iswa::triattention_init_from_model(
+    const llama_model & model,
+    const llama_cparams & cparams,
+    const char * stats_path,
+    const triattention_config * cfg) {
+    return mem_attn->triattention_init_from_model(model, cparams, stats_path, cfg);
+}
+
+bool llama_memory_hybrid_iswa::triattention_is_active() const {
+    return mem_attn->triattention_is_active();
+}
+
 llama_kv_cache_iswa * llama_memory_hybrid_iswa::get_mem_attn() const {
     return mem_attn.get();
 }

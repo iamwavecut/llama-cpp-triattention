@@ -1,5 +1,6 @@
 #include "llama-kv-cache.h"
 #include "llama-triattention.h"
+#include "llama-triattention-file.h"
 
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -2627,7 +2628,44 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 // llama_kv_cache: TriAttention integration
 //
 
-void llama_kv_cache::init_triattention(const char * stats_path, const triattention_config * cfg, const triattention_model_params * model_params) {
+int32_t llama_kv_cache::triattention_init_from_model(
+    const llama_model & model,
+    const llama_cparams & cparams,
+    const char * stats_path,
+    const triattention_config * cfg) {
+    if (!cfg) {
+        return -1;
+    }
+
+    triattention_model_params model_params = {};
+    if (!triattention_model_params_init(&model, &cparams, get_size(), &model_params)) {
+        LLAMA_LOG_ERROR("%s: failed to derive TriAttention model parameters\n", __func__);
+        return -1;
+    }
+
+    std::vector<uint32_t> sampled_layers;
+    sampled_layers.reserve(map_layer_ids.size());
+    for (const auto & it : map_layer_ids) {
+        sampled_layers.push_back(it.first);
+    }
+    std::sort(sampled_layers.begin(), sampled_layers.end());
+    sampled_layers.erase(std::unique(sampled_layers.begin(), sampled_layers.end()), sampled_layers.end());
+
+    init_triattention(stats_path, cfg, &model_params, sampled_layers.data(), (uint32_t) sampled_layers.size());
+    triattention_model_params_clear(&model_params);
+    return triattention_st ? 0 : -1;
+}
+
+bool llama_kv_cache::triattention_is_active() const {
+    return has_triattention();
+}
+
+void llama_kv_cache::init_triattention(
+    const char * stats_path,
+    const triattention_config * cfg,
+    const triattention_model_params * model_params,
+    const uint32_t * sampled_layers,
+    uint32_t n_sampled_layers) {
     if (!cfg || !model_params) {
         return;
     }
@@ -2636,7 +2674,7 @@ void llama_kv_cache::init_triattention(const char * stats_path, const triattenti
         triattention_st = nullptr;
     }
 
-    triattention_st = triattention_init(stats_path, cfg, model_params);
+    triattention_st = triattention_init(stats_path, cfg, model_params, sampled_layers, n_sampled_layers);
     if (!triattention_st) {
         LLAMA_LOG_ERROR("%s: failed to initialize TriAttention (stats=%s)\n",
                 __func__, stats_path && stats_path[0] ? stats_path : "<none>");
@@ -2651,11 +2689,16 @@ int32_t llama_kv_cache::triattention_try_prune() {
     // Build K tensor array and layer map for triattention_prune_impl()
     const uint32_t n_kv_layers = (uint32_t)layers.size();
     std::vector<ggml_tensor *> k_tensors(n_kv_layers);
-    std::vector<int32_t> layer_map(n_kv_layers);
+    std::vector<int32_t> layer_to_cache(hparams.n_layer, -1);
 
     for (uint32_t i = 0; i < n_kv_layers; i++) {
         k_tensors[i] = layers[i].k;
-        layer_map[i] = (int32_t)layers[i].il;
+        layer_to_cache[layers[i].il] = (int32_t) i;
+    }
+    for (const auto & it : map_layer_ids) {
+        if (it.first < layer_to_cache.size()) {
+            layer_to_cache[it.first] = it.second;
+        }
     }
 
     const uint32_t kv_size = (uint32_t)v_cells[0].size();
@@ -2664,7 +2707,7 @@ int32_t llama_kv_cache::triattention_try_prune() {
         triattention_st,
         k_tensors.data(),
         n_kv_layers,
-        layer_map.data(),
+        layer_to_cache.data(),
         kv_size);
 
     if (n_evicted > 0) {

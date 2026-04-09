@@ -5,7 +5,6 @@
 
 #include "ggml-backend.h"
 #include "llama-context.h"
-#include "llama-kv-cache.h"
 #include "llama-model.h"
 #include "llama-triattention-calibration.h"
 #include "llama-triattention-file.h"
@@ -111,42 +110,8 @@ static bool build_model_params_from_context(llama_context * ctx, triattention_mo
     }
 
     const llama_model & model = ctx->get_model();
-    const llama_hparams & hparams = model.hparams;
     const llama_cparams & cparams = ctx->get_cparams();
-    auto * kv = dynamic_cast<llama_kv_cache *>(ctx->get_memory());
-    if (!kv) {
-        return false;
-    }
-
-    uint32_t rope_style = 0;
-    switch (llama_model_rope_type(&model)) {
-        case LLAMA_ROPE_TYPE_NORM:
-            rope_style = 1;
-            break;
-        case LLAMA_ROPE_TYPE_NEOX:
-        case LLAMA_ROPE_TYPE_MROPE:
-        case LLAMA_ROPE_TYPE_IMROPE:
-            rope_style = 0;
-            break;
-        default:
-            return false;
-    }
-
-    out->kv_size          = kv->get_size();
-    out->head_dim         = hparams.n_embd_head_k(0);
-    out->num_layers       = hparams.n_layer;
-    out->num_attn_heads   = hparams.n_head(0);
-    out->num_kv_heads     = hparams.n_head_kv(0);
-    out->rope_style       = rope_style;
-    out->n_ctx_orig       = hparams.n_ctx_orig_yarn;
-    out->rope_theta       = (double) cparams.rope_freq_base;
-    out->rope_freq_scale  = cparams.rope_freq_scale;
-    out->rope_ext_factor  = cparams.yarn_ext_factor;
-    out->rope_attn_factor = cparams.yarn_attn_factor;
-    out->rope_beta_fast   = cparams.yarn_beta_fast;
-    out->rope_beta_slow   = cparams.yarn_beta_slow;
-
-    return true;
+    return triattention_model_params_init(&model, &cparams, 0, out);
 }
 
 static std::string infer_model_name(const llama_model * model, const common_params & params) {
@@ -221,8 +186,26 @@ static bool run_calibration(llama_context * ctx, const common_params & params, c
     LOG_INF("%s: tokenized %zu tokens, chunk_size=%d, batch_size=%d\n",
             __func__, tokens.size(), chunk_size, batch_size);
 
+    if (params.i_chunk > 0) {
+        const size_t skip_tokens = (size_t) params.i_chunk * (size_t) chunk_size;
+        if (skip_tokens >= tokens.size()) {
+            LOG_ERR("%s: there are not enough tokens left after removing %d chunks (%zu tokens)\n",
+                    __func__, params.i_chunk, skip_tokens);
+            return false;
+        }
+
+        LOG_INF("%s: removing initial %d chunks (%zu tokens)\n",
+                __func__, params.i_chunk, skip_tokens);
+        tokens.erase(tokens.begin(), tokens.begin() + (ptrdiff_t) skip_tokens);
+    }
+
     llama_batch batch = llama_batch_init(batch_size, 0, 1);
-    const size_t n_chunk = (tokens.size() + (size_t) chunk_size - 1) / (size_t) chunk_size;
+    const size_t n_chunk_max = (tokens.size() + (size_t) chunk_size - 1) / (size_t) chunk_size;
+    const size_t n_chunk = params.n_chunks < 0
+        ? n_chunk_max
+        : std::min((size_t) params.n_chunks, n_chunk_max);
+
+    LOG_INF("%s: computing over %zu chunks\n", __func__, n_chunk);
 
     for (size_t chunk = 0; chunk < n_chunk; ++chunk) {
         const size_t start = chunk * (size_t) chunk_size;
@@ -299,6 +282,7 @@ int main(int argc, char ** argv) {
     params.warmup = false;
     params.compute_ppl = false;
     params.n_parallel = 1;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
 
     if (mode == tool_mode::validate) {
         if (params.model.path.empty()) {
@@ -331,6 +315,7 @@ int main(int argc, char ** argv) {
         const bool ok = triattention_calibration_validate(cal, &model_params, true);
         LOG("%s\n", ok ? "validation: OK" : "validation: FAILED");
         triattention_calibration_free(cal);
+        triattention_model_params_clear(&model_params);
         llama_backend_free();
         return ok ? 0 : 1;
     }
@@ -351,7 +336,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    triattention_calibration_builder builder("", 0, 0, 0);
+    triattention_model_params model_params = {};
+    triattention_calibration_builder builder("", nullptr);
     capture_context capture(builder);
     params.cb_eval = triattention_capture_cb;
     params.cb_eval_user_data = &capture;
@@ -365,11 +351,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    builder = triattention_calibration_builder(
-        infer_model_name(model, params),
-        (uint32_t) model->hparams.n_layer,
-        (uint32_t) model->hparams.n_head(0),
-        (uint32_t) model->hparams.n_head_kv(0));
+    if (!triattention_model_params_init(model, &ctx->get_cparams(), 0, &model_params)) {
+        LOG_ERR("failed to derive model parameters for calibration\n");
+        llama_backend_free();
+        return 1;
+    }
+
+    builder = triattention_calibration_builder(infer_model_name(model, params), &model_params);
 
     capture_context real_capture(builder);
     params.cb_eval_user_data = &real_capture;
@@ -385,6 +373,7 @@ int main(int argc, char ** argv) {
                 LOG_ERR("  %s\n", name.c_str());
             }
         }
+        triattention_model_params_clear(&model_params);
         llama_backend_free();
         return 1;
     }
@@ -397,18 +386,21 @@ int main(int argc, char ** argv) {
         for (const auto & name : builder.rope_sources_seen()) {
             LOG_ERR("  %s\n", name.c_str());
         }
+        triattention_model_params_clear(&model_params);
         llama_backend_free();
         return 1;
     }
 
     if (!triattention_calibration_save(params.out_file.c_str(), cal)) {
         triattention_calibration_free(cal);
+        triattention_model_params_clear(&model_params);
         llama_backend_free();
         return 1;
     }
 
     LOG("wrote calibration: %s\n", params.out_file.c_str());
     triattention_calibration_free(cal);
+    triattention_model_params_clear(&model_params);
     llama_backend_free();
     return 0;
 }

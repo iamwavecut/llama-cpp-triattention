@@ -9,6 +9,50 @@ static bool approx_equal(float a, float b, float eps = 1e-5f) {
     return std::fabs(a - b) <= eps;
 }
 
+static triattention_model_params make_synthetic_model() {
+    triattention_model_params model = {};
+    model.num_layers = 1;
+    model.head_dim = 4;
+    model.rope_dim = 4;
+    model.num_attn_heads = 1;
+    model.num_kv_heads = 1;
+    model.rope_style = 0;
+    model.n_ctx_orig = 128;
+    model.rope_theta = 10000.0;
+    model.rope_freq_scale = 1.0f;
+    model.rope_ext_factor = 0.0f;
+    model.rope_attn_factor = 1.0f;
+    model.rope_beta_fast = 32.0f;
+    model.rope_beta_slow = 1.0f;
+    model.max_head_dim = 4;
+    model.max_rope_dim = 4;
+    model.max_freq_count = 2;
+    model.layers = new triattention_layer_params[1];
+    std::memset(model.layers, 0, sizeof(triattention_layer_params));
+
+    triattention_layer_params & layer = model.layers[0];
+    layer.head_dim = 4;
+    layer.rope_dim = 4;
+    layer.rope_offset = 0;
+    layer.num_attn_heads = 1;
+    layer.num_kv_heads = 1;
+    layer.num_kv_groups = 1;
+    layer.kv_source_layer = 0;
+    layer.rope_style = 0;
+    layer.freq_count = 2;
+    layer.n_ctx_orig = 128;
+    layer.rope_theta = 10000.0;
+    layer.rope_freq_scale = 1.0f;
+    layer.rope_ext_factor = 0.0f;
+    layer.rope_attn_factor = 1.0f;
+    layer.rope_beta_fast = 32.0f;
+    layer.rope_beta_slow = 1.0f;
+    layer.omega = new float[2] { 1.0f, 0.1f };
+    layer.freq_scale_sq = new float[2] { 1.0f, 1.0f };
+
+    return model;
+}
+
 int main() {
     testing t;
 
@@ -65,7 +109,8 @@ int main() {
             /*.freq_factor_count =*/ 0,
         };
 
-        triattention_calibration_builder builder("synthetic", 1, 1, 1);
+        triattention_model_params model = make_synthetic_model();
+        triattention_calibration_builder builder("synthetic", &model);
         std::string error;
         t.assert_true(builder.accumulate_query_tensor(tensor, tensor->data, 0, 0, rope_params, &error));
 
@@ -73,6 +118,10 @@ int main() {
         t.assert_true(error, cal != nullptr);
         t.assert_equal((uint32_t) 1, cal->n_sampled);
         t.assert_equal((uint32_t) 2, cal->freq_count);
+        t.assert_equal((uint32_t) 4, cal->layers[0].head_dim);
+        t.assert_equal((uint32_t) 4, cal->layers[0].rope_dim);
+        t.assert_true(cal->layers[0].omega != nullptr);
+        t.assert_true(cal->layers[0].freq_scale_sq != nullptr);
 
         const triattention_head_stats & hs = cal->head_stats[0];
         const float abs0 = 0.5f * (std::sqrt(5.0f) + std::sqrt(61.0f));
@@ -90,6 +139,7 @@ int main() {
         t.assert_true(approx_equal(hs.r_f[1], rf1));
 
         triattention_calibration_free(cal);
+        triattention_model_params_clear(&model);
         ggml_free(ctx);
     });
 

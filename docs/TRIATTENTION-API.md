@@ -1,96 +1,90 @@
 # TriAttention API Reference
 
-## C API (include/llama.h)
+## Public C API
 
-### llama_triattention_init
+### `llama_triattention_init`
 
 ```c
-LLAMA_API bool llama_triattention_init(
-    struct llama_context * ctx,
-    const char * stats_path,
-    int32_t  budget,
-    int32_t  divide_length,
-    int32_t  offset_max,
-    int32_t  mode,
-    int32_t  trigger,
-    int32_t  agg,
-    int32_t  seed,
-    bool     normalize,
-    bool     protect_prefill,
-    bool     disable_mlr,
-    bool     disable_trig,
-    bool     enable_logging);
+LLAMA_API int32_t llama_triattention_init(
+        struct llama_context * ctx,
+                  const char * stats_path,
+                     int32_t   budget,
+                     int32_t   divide_length,
+                     int32_t   offset_max,
+                     int32_t   mode,
+                     int32_t   trigger,
+                     int32_t   agg,
+                     int32_t   seed,
+                        bool   normalize_scores,
+                        bool   protect_prefill,
+                        bool   disable_mlr,
+                        bool   disable_trig,
+                        bool   enable_logging,
+                     int32_t   fallback_mode,
+                        float   fallback_recency_weight);
 ```
 
-Initialize TriAttention KV cache eviction on a context. Must be called after
-context creation and before inference begins.
+Initializes TriAttention on a `llama_context`.
 
-**Parameters:**
+| Parameter | Description |
+|-----------|-------------|
+| `ctx` | Context whose KV cache will be pruned |
+| `stats_path` | Optional path to a `.triattention` file |
+| `budget` | Maximum KV entries retained after pruning |
+| `divide_length` | Pruning interval; the same recent window is protected from eviction |
+| `offset_max` | Maximum geometric offset for trig scoring |
+| `mode` | `0=global`, `1=per-kv-head`, `2=per-layer-head` |
+| `trigger` | `0=interval`, `1=slack` |
+| `agg` | `0=mean`, `1=max` |
+| `seed` | Tie-breaking noise seed; `-1` disables it |
+| `normalize_scores` | Z-score normalize per-head scores before selection |
+| `protect_prefill` | Keep prompt/prefix tokens protected |
+| `disable_mlr` | Disable MLR weighting in the norm term |
+| `disable_trig` | Disable the trigonometric term |
+| `enable_logging` | Log prune events to stderr |
+| `fallback_mode` | `0=off`, `1=auto`, `2=hybrid-norm-recency` |
+| `fallback_recency_weight` | Blend factor for fallback recency scoring |
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `ctx` | `llama_context *` | The context to enable TriAttention on |
-| `stats_path` | `const char *` | Path to `.triattention` calibration file |
-| `budget` | `int32_t` | Max KV entries after pruning (e.g., 2048) |
-| `divide_length` | `int32_t` | Pruning interval in tokens (e.g., 128) |
-| `offset_max` | `int32_t` | Max geometric offset (e.g., 65536) |
-| `mode` | `int32_t` | 0=global, 1=per-kv-head, 2=per-layer-head |
-| `trigger` | `int32_t` | 0=interval, 1=slack |
-| `agg` | `int32_t` | 0=mean, 1=max aggregation |
-| `seed` | `int32_t` | RNG seed for tie-breaking (0=deterministic) |
-| `normalize` | `bool` | Z-score normalize before selection |
-| `protect_prefill` | `bool` | Protect prompt tokens from eviction |
-| `disable_mlr` | `bool` | Ablation: disable MLR weighting |
-| `disable_trig` | `bool` | Ablation: norm-only scoring |
-| `enable_logging` | `bool` | Log pruning events to stderr |
+Returns `0` on success and `-1` on failure.
 
-**Returns:** `true` if initialization succeeded, `false` on error (bad file,
-model mismatch, context doesn't use KV cache).
-
----
-
-## Internal C++ API (src/llama-triattention.h)
+## Internal runtime API
 
 ### Core lifecycle
 
 ```c
-// Initialize from calibration file + config
 triattention_state * triattention_init(
     const char * stats_path,
     const triattention_config * cfg,
-    uint32_t kv_size,
-    double   rope_theta,
-    uint32_t head_dim,
-    uint32_t n_kv_heads);
+    const triattention_model_params * model);
 
-// Free all resources
 void triattention_free(triattention_state * state);
 ```
 
-### Scoring functions
+`triattention_init()` loads and validates the calibration file when one is
+provided. If no file is provided and fallback is enabled, it constructs a
+fallback calibration state from model geometry and RoPE parameters.
+
+### Scoring and pruning helpers
 
 ```c
-// Invert RoPE rotation on dequantized K vectors
-// Converts from post-RoPE to pre-RoPE representation
 void triattention_invert_rope(
-    float * k,                  // [n_keys, head_dim] in-place
-    const float * omega,        // [freq_count] RoPE frequencies
-    const int32_t * positions,  // [n_keys] token positions
+    float * k,
+    const float * omega,
+    const int32_t * positions,
     uint32_t n_keys,
     uint32_t head_dim,
     uint32_t freq_count,
-    uint32_t rope_style);       // 0=half, 1=interleaved
+    uint32_t rope_style);
 
-// Score keys by TriAttention formula
 void triattention_score_keys(
-    float       * out_scores,
+    float * out_scores,
     const float * pre_rope_k,
     const triattention_head_stats * stats,
     const float * omega,
     const float * freq_scale_sq,
     const float * offsets,
     const int32_t * key_positions,
-    int64_t  round_start,
+    int64_t round_start,
     uint32_t n_keys,
     uint32_t head_dim,
     uint32_t freq_count,
@@ -98,172 +92,218 @@ void triattention_score_keys(
     enum triattention_agg agg,
     bool disable_trig);
 
-// Full pruning pipeline (called from KV cache)
+void triattention_build_recency_scores(
+    float * out_scores,
+    const int32_t * key_positions,
+    uint32_t n_keys);
+
+void triattention_blend_fallback_scores(
+    float * scores,
+    const float * recency_scores,
+    uint32_t n_keys,
+    float lambda);
+
 void triattention_prune_impl(
     triattention_state * state,
     const ggml_tensor ** k_tensors,
-    const uint32_t    * layer_map,
-    uint32_t            n_layers,
-    uint32_t            n_kv_heads,
-    uint32_t            padded_head_dim,
-    uint32_t            kv_size,
-    uint32_t          * evicted_cells,
-    uint32_t          * n_evicted);
+    const uint32_t * layer_map,
+    uint32_t n_layers,
+    uint32_t n_kv_heads,
+    uint32_t padded_head_dim,
+    uint32_t kv_size,
+    uint32_t * evicted_cells,
+    uint32_t * n_evicted);
 ```
 
-### Position tracking hooks
+## Internal file API
+
+`src/llama-triattention-file.cpp` owns the binary `.triattention` format:
 
 ```c
-void triattention_on_token_added(triattention_state * s, uint32_t cell_idx, int32_t pos);
-void triattention_on_cell_removed(triattention_state * s, uint32_t cell_idx);
-void triattention_on_position_shift(triattention_state * s, int32_t shift, int32_t p0, int32_t p1);
-void triattention_on_reset(triattention_state * s);
+bool triattention_build_rope_arrays(
+    float * omega,
+    float * freq_scale_sq,
+    uint32_t freq_count,
+    const triattention_rope_params * params);
+
+triattention_calibration * triattention_calibration_load(const char * path, bool verbose);
+bool triattention_calibration_save(const char * path, const triattention_calibration * cal);
+void triattention_calibration_free(triattention_calibration * cal);
+
+bool triattention_calibration_validate(
+    const triattention_calibration * cal,
+    const triattention_model_params * model,
+    bool warn_rope_theta);
+
+triattention_calibration * triattention_calibration_create_fallback(
+    const triattention_model_params * model);
 ```
 
-These must be called from the KV cache implementation whenever cells are
-modified. They maintain the O(1) position lookup table used by the scoring
-pipeline.
+## Internal calibration API
 
-### Statistics
+The standalone tool uses `ggml_backend_sched_eval_callback()` and the helpers
+below to collect pre-RoPE query statistics directly from a `GGUF` model:
 
 ```c
-void triattention_print_stats(const triattention_state * state);
+bool triattention_is_query_rope_name(const char * name);
+bool triattention_parse_layer_index(const char * name, uint32_t * layer_idx);
+bool triattention_extract_rope_params(
+    const ggml_tensor * rope_tensor,
+    triattention_rope_params * params,
+    uint32_t * rope_style,
+    std::string * error);
+
+class triattention_calibration_builder {
+public:
+    triattention_calibration_builder(
+        std::string model_name,
+        uint32_t num_layers,
+        uint32_t num_attn_heads,
+        uint32_t num_kv_heads);
+
+    void note_rope_source(const char * name);
+
+    bool accumulate_query_tensor(
+        const ggml_tensor * src0,
+        const void * src0_data,
+        uint32_t layer_idx,
+        uint32_t rope_style,
+        const triattention_rope_params & rope_params,
+        std::string * error);
+
+    triattention_calibration * finalize(std::string * error) const;
+};
 ```
 
-Prints pruning statistics: total calls, total tokens evicted, average timing.
+The builder computes streaming statistics for each sampled `(layer, attn_head,
+freq)` tuple:
 
----
+| Field | Meaning |
+|-------|---------|
+| `q_mean_real` | Real part of `E[q_f]` |
+| `q_mean_imag` | Imaginary part of `E[q_f]` |
+| `q_abs_mean` | `E[|q_f|]` |
+| `r_f` | `|E[q_f]| / E[|q_f|]` |
 
-## Structs
+## Core structs
 
-### triattention_config
+### `triattention_model_params`
+
+```c
+struct triattention_model_params {
+    uint32_t kv_size;
+    uint32_t head_dim;
+    uint32_t num_layers;
+    uint32_t num_attn_heads;
+    uint32_t num_kv_heads;
+    uint32_t rope_style;
+    uint32_t n_ctx_orig;
+
+    double rope_theta;
+    float  rope_freq_scale;
+    float  rope_ext_factor;
+    float  rope_attn_factor;
+    float  rope_beta_fast;
+    float  rope_beta_slow;
+};
+```
+
+### `triattention_config`
 
 ```c
 struct triattention_config {
-    int32_t  budget;
-    int32_t  divide_length;       // pruning interval
-    int32_t  offset_max;
-    enum triattention_mode mode;
+    uint32_t budget;
+    uint32_t divide_length;
+    uint32_t offset_max;
+
+    enum triattention_mode    mode;
     enum triattention_trigger trigger;
-    enum triattention_agg agg;
-    int32_t  seed;
-    bool     normalize;
-    bool     protect_prefill;
-    bool     disable_mlr;
-    bool     disable_trig;
-    bool     enable_logging;
+    enum triattention_agg     agg;
+
+    bool normalize_scores;
+    bool protect_prefill;
+    bool disable_mlr;
+    bool disable_trig;
+    bool enable_logging;
+
+    int32_t seed;
+
+    enum triattention_fallback fallback_mode;
+    float fallback_recency_weight;
 };
 ```
 
-### triattention_head_stats
-
-```c
-struct triattention_head_stats {
-    float * q_mean_real;    // [freq_count] Re(E[q_f])
-    float * q_mean_imag;    // [freq_count] Im(E[q_f])
-    float * q_abs_mean;     // [freq_count] E[||q_f||]
-    float * q_mean_abs;     // [freq_count] ||E[q_f]|| (precomputed at init)
-    float * extra_weight;   // [freq_count] excess weight (precomputed at init)
-};
-```
-
-### triattention_calibration
+### `triattention_calibration`
 
 ```c
 struct triattention_calibration {
+    uint32_t version;
     uint32_t head_dim;
     uint32_t num_layers;
     uint32_t num_attn_heads;
     uint32_t num_kv_heads;
     uint32_t num_kv_groups;
-    uint32_t freq_count;
-    uint32_t n_sampled;
     double   rope_theta;
     uint32_t rope_style;
-    char *   model_name;
+    uint32_t freq_count;
+    uint32_t n_sampled;
+
+    float * omega;
+    float * freq_scale_sq;
+
+    uint32_t * sampled_layer;
+    uint32_t * sampled_head;
     triattention_head_stats * head_stats;
-    uint32_t * sample_layer;
-    uint32_t * sample_head;
+
+    char model_name[256];
 };
 ```
 
----
-
-## CUDA GPU Scoring API (ggml/include/ggml-cuda.h)
-
-The GPU scoring path avoids the GPU→CPU transfer of the full K tensor by
-computing importance scores directly on the GPU. Only the resulting score
-array (one float per position) is copied back to the CPU.
-
-### triattention_gpu_init
-
-```c
-triattention_gpu_state * triattention_gpu_init(
-    const triattention_gpu_config * config,
-    const triattention_gpu_head_calib * head_calibs,
-    const float * omega,
-    const float * freq_scale_sq,
-    const float * offsets,
-    void * stream);
-```
-
-Upload calibration data and precomputed arrays to GPU memory.
-
-### triattention_gpu_score_head
-
-```c
-void triattention_gpu_score_head(
-    triattention_gpu_state * state,
-    const void   * k_data_dev,
-    uint64_t       n_embd_k_gqa,
-    size_t         row_bytes,
-    uint32_t       kv_head_idx,
-    uint32_t       head_calib_idx,
-    const uint32_t * cell_indices_dev,
-    const int32_t  * positions_dev,
-    uint32_t       n_cells,
-    int64_t        round_start,
-    int            agg_mode,
-    float        * scores_dev,
-    void * stream);
-```
-
-Launch the scoring kernel for one KV head. Each thread block processes one
-cache position, with `freq_count` threads cooperating on dequantization,
-inverse WHT rotation, inverse RoPE, and score computation.
-
-### Utility functions
-
-```c
-void  triattention_gpu_scores_to_host(float * host, const float * dev, uint32_t n, void * stream);
-void  triattention_gpu_upload_cells(uint32_t ** ci_dev, int32_t ** pos_dev, ...);
-float * triattention_gpu_alloc_scores(uint32_t n_cells, void * stream);
-void  triattention_gpu_free_dev(void * ptr);
-void  triattention_gpu_free(triattention_gpu_state * state);
-```
-
----
-
 ## Enums
 
-### triattention_mode
+### `triattention_mode`
 
-| Value | Name | Description |
-|-------|------|-------------|
-| 0 | `TRIATTENTION_MODE_GLOBAL` | Union-based global selection |
-| 1 | `TRIATTENTION_MODE_PER_KV_HEAD` | Independent per-KV-head selection |
-| 2 | `TRIATTENTION_MODE_PER_LAYER_HEAD` | Independent per-layer-head selection |
+| Value | Name |
+|-------|------|
+| `0` | `TRIATTENTION_MODE_GLOBAL` |
+| `1` | `TRIATTENTION_MODE_PER_KV_HEAD` |
+| `2` | `TRIATTENTION_MODE_PER_LAYER_HEAD` |
 
-### triattention_trigger
+### `triattention_trigger`
 
-| Value | Name | Description |
-|-------|------|-------------|
-| 0 | `TRIATTENTION_TRIGGER_INTERVAL` | Prune every N decode tokens |
-| 1 | `TRIATTENTION_TRIGGER_SLACK` | Prune at budget + window occupancy |
+| Value | Name |
+|-------|------|
+| `0` | `TRIATTENTION_TRIGGER_INTERVAL` |
+| `1` | `TRIATTENTION_TRIGGER_SLACK` |
 
-### triattention_agg
+### `triattention_agg`
 
-| Value | Name | Description |
-|-------|------|-------------|
-| 0 | `TRIATTENTION_AGG_MEAN` | Average score over geometric offsets |
-| 1 | `TRIATTENTION_AGG_MAX` | Max score over geometric offsets |
+| Value | Name |
+|-------|------|
+| `0` | `TRIATTENTION_AGG_MEAN` |
+| `1` | `TRIATTENTION_AGG_MAX` |
+
+### `triattention_fallback`
+
+| Value | Name |
+|-------|------|
+| `0` | `TRIATTENTION_FALLBACK_OFF` |
+| `1` | `TRIATTENTION_FALLBACK_AUTO` |
+| `2` | `TRIATTENTION_FALLBACK_HYBRID_NORM_RECENCY` |
+
+## User-facing tool
+
+The supported calibration entrypoint is the standalone binary:
+
+```text
+llama-triattention-calibrate
+```
+
+Supported modes:
+
+| Mode | Example |
+|------|---------|
+| Build | `llama-triattention-calibrate -m model.gguf -f corpus.txt -o model.triattention` |
+| Inspect | `llama-triattention-calibrate --inspect model.triattention` |
+| Validate | `llama-triattention-calibrate --validate model.triattention -m model.gguf` |
+

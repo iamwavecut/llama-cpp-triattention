@@ -3890,8 +3890,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     // TriAttention KV cache eviction args
     add_opt(common_arg(
         {"--triattention-stats"}, "PATH",
-        "path to .triattention calibration file (enables TriAttention eviction)",
+        "path to .triattention calibration file (preferred; fallback can run without it)",
         [](common_params & params, const std::string & value) {
+            params.triattention_requested = true;
             params.triattention_stats = value;
         }
     ).set_env("LLAMA_ARG_TRIATTENTION_STATS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
@@ -3899,6 +3900,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--triattention-budget"}, "N",
         string_format("max KV entries to retain after pruning (default: %d)", params.triattention_budget),
         [](common_params & params, int value) {
+            params.triattention_requested = true;
             params.triattention_budget = value;
         }
     ).set_env("LLAMA_ARG_TRIATTENTION_BUDGET").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
@@ -3906,6 +3908,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--triattention-window"}, "N",
         string_format("pruning interval in decode tokens (default: %d)", params.triattention_window),
         [](common_params & params, int value) {
+            params.triattention_requested = true;
             params.triattention_window = value;
         }
     ).set_env("LLAMA_ARG_TRIATTENTION_WINDOW").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
@@ -3913,6 +3916,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--triattention-offset-max"}, "N",
         string_format("max geometric offset for scoring (default: %d)", params.triattention_offset_max),
         [](common_params & params, int value) {
+            params.triattention_requested = true;
             params.triattention_offset_max = value;
         }
     ).set_env("LLAMA_ARG_TRIATTENTION_OFFSET_MAX").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
@@ -3920,6 +3924,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--triattention-mode"}, "MODE",
         "pruning mode: global, per-kv-head, per-layer-head (default: global)",
         [](common_params & params, const std::string & value) {
+            params.triattention_requested = true;
             if (value == "global")          params.triattention_mode = 0;
             else if (value == "per-kv-head")     params.triattention_mode = 1;
             else if (value == "per-layer-head")  params.triattention_mode = 2;
@@ -3930,15 +3935,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--triattention-trigger"}, "MODE",
         "trigger strategy: interval, slack (default: interval)",
         [](common_params & params, const std::string & value) {
+            params.triattention_requested = true;
             if (value == "interval")    params.triattention_trigger = 0;
             else if (value == "slack")  params.triattention_trigger = 1;
             else throw std::invalid_argument("invalid triattention trigger: " + value);
         }
     ).set_env("LLAMA_ARG_TRIATTENTION_TRIGGER").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--triattention-fallback"}, "MODE",
+        "fallback policy when no stats file is provided: auto, off, hybrid-norm-recency (default: auto)",
+        [](common_params & params, const std::string & value) {
+            params.triattention_requested = true;
+            if (value == "off") params.triattention_fallback = 0;
+            else if (value == "auto") params.triattention_fallback = 1;
+            else if (value == "hybrid-norm-recency") params.triattention_fallback = 2;
+            else throw std::invalid_argument("invalid triattention fallback mode: " + value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--triattention-fallback-recency-weight"}, "F",
+        string_format("fallback recency blend in [0,1] (default: %.2f)", params.triattention_fallback_recency_weight),
+        [](common_params & params, const std::string & value) {
+            params.triattention_requested = true;
+            params.triattention_fallback_recency_weight = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--triattention-agg"}, "MODE",
         "score aggregation: mean, max (default: mean)",
         [](common_params & params, const std::string & value) {
+            params.triattention_requested = true;
             if (value == "mean")    params.triattention_agg = 0;
             else if (value == "max")  params.triattention_agg = 1;
             else throw std::invalid_argument("invalid triattention aggregation: " + value);
@@ -3948,6 +3974,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--triattention-seed"}, "N",
         string_format("RNG seed for tie-breaking noise, -1 to disable (default: %d)", params.triattention_seed),
         [](common_params & params, int value) {
+            params.triattention_requested = true;
             params.triattention_seed = value;
         }
     ).set_env("LLAMA_ARG_TRIATTENTION_SEED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
@@ -3955,6 +3982,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--triattention-normalize"},
         "z-score normalize scores per head before selection",
         [](common_params & params) {
+            params.triattention_requested = true;
             params.triattention_normalize = true;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
@@ -3962,6 +3990,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--triattention-no-protect-prefill"},
         "allow eviction of prompt tokens (default: protected)",
         [](common_params & params) {
+            params.triattention_requested = true;
             params.triattention_protect_prefill = false;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
@@ -3969,6 +3998,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--triattention-disable-mlr"},
         "ablation: disable MLR weighting in norm term",
         [](common_params & params) {
+            params.triattention_requested = true;
             params.triattention_disable_mlr = true;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
@@ -3976,6 +4006,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--triattention-disable-trig"},
         "ablation: use norm-only scoring (no trigonometric term)",
         [](common_params & params) {
+            params.triattention_requested = true;
             params.triattention_disable_trig = true;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
@@ -3983,6 +4014,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--triattention-log"},
         "log TriAttention pruning events to stderr",
         [](common_params & params) {
+            params.triattention_requested = true;
             params.triattention_log = true;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));

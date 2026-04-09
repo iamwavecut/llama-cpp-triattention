@@ -233,6 +233,15 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 
 llama_build_and_test(test-arg-parser.cpp)
 
+llama_build_and_test(test-triattention-calibration.cpp)
+target_include_directories(test-triattention-calibration PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+llama_build_and_test(test-triattention-file.cpp)
+target_include_directories(test-triattention-file PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+llama_build_and_test(test-triattention-fallback.cpp)
+target_include_directories(test-triattention-fallback PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)
@@ -256,6 +265,111 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)
 endif()
+
+set(TRIATTENTION_CORPUS "${PROJECT_SOURCE_DIR}/tests/triattention-corpus.txt")
+set(TRIATTENTION_FILE "${CMAKE_BINARY_DIR}/triattention-smoke.triattention")
+
+add_test(
+    NAME test-triattention-calibrate-build
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+    COMMAND $<TARGET_FILE:llama-triattention-calibrate>
+        -m "${MODEL_DEST}"
+        -f "${TRIATTENTION_CORPUS}"
+        -o "${TRIATTENTION_FILE}"
+        -c 64
+        -b 64
+        -ngl 0
+)
+set_tests_properties(test-triattention-calibrate-build PROPERTIES
+    LABELS "model"
+    FIXTURES_REQUIRED test-download-model
+    FIXTURES_SETUP triattention-calibration)
+
+add_test(
+    NAME test-triattention-calibrate-inspect
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+    COMMAND $<TARGET_FILE:llama-triattention-calibrate>
+        --inspect "${TRIATTENTION_FILE}"
+        -m "${MODEL_DEST}"
+)
+set_tests_properties(test-triattention-calibrate-inspect PROPERTIES
+    LABELS "model"
+    FIXTURES_REQUIRED triattention-calibration)
+
+add_test(
+    NAME test-triattention-calibrate-validate
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+    COMMAND $<TARGET_FILE:llama-triattention-calibrate>
+        --validate "${TRIATTENTION_FILE}"
+        -m "${MODEL_DEST}"
+        -ngl 0
+)
+set_tests_properties(test-triattention-calibrate-validate PROPERTIES
+    LABELS "model"
+    FIXTURES_REQUIRED "test-download-model;triattention-calibration")
+
+add_test(
+    NAME test-triattention-runtime-calibrated
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+    COMMAND $<TARGET_FILE:llama-cli>
+        -m "${MODEL_DEST}"
+        -f "${TRIATTENTION_CORPUS}"
+        -st
+        -no-cnv
+        --simple-io
+        --no-display-prompt
+        -ngl 0
+        -c 64
+        -n 2
+        --triattention-stats "${TRIATTENTION_FILE}"
+        --triattention-budget 4
+        --triattention-window 2
+)
+set_tests_properties(test-triattention-runtime-calibrated PROPERTIES
+    LABELS "model"
+    FIXTURES_REQUIRED "test-download-model;triattention-calibration")
+
+add_test(
+    NAME test-triattention-runtime-fallback-auto
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+    COMMAND $<TARGET_FILE:llama-cli>
+        -m "${MODEL_DEST}"
+        -f "${TRIATTENTION_CORPUS}"
+        -st
+        -no-cnv
+        --simple-io
+        --no-display-prompt
+        -ngl 0
+        -c 64
+        -n 2
+        --triattention-budget 4
+        --triattention-window 2
+)
+set_tests_properties(test-triattention-runtime-fallback-auto PROPERTIES
+    LABELS "model"
+    FIXTURES_REQUIRED test-download-model)
+
+add_test(
+    NAME test-triattention-runtime-fallback-off
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+    COMMAND $<TARGET_FILE:llama-cli>
+        -m "${MODEL_DEST}"
+        -f "${TRIATTENTION_CORPUS}"
+        -st
+        -no-cnv
+        --simple-io
+        --no-display-prompt
+        -ngl 0
+        -c 64
+        -n 1
+        --triattention-budget 4
+        --triattention-window 2
+        --triattention-fallback off
+)
+set_tests_properties(test-triattention-runtime-fallback-off PROPERTIES
+    LABELS "model"
+    FIXTURES_REQUIRED test-download-model
+    WILL_FAIL TRUE)
 
 # libmtmd
 set(LLAMA_TEST_NAME test-mtmd-c-api)

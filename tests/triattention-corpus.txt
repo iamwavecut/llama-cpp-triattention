@@ -1,0 +1,4 @@
+The quick brown fox jumps over the lazy dog.
+TriAttention calibration smoke test corpus.
+This file is intentionally short but non-empty.
+It is used for standalone calibration and runtime smoke tests.

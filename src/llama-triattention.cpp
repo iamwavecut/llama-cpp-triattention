@@ -13,6 +13,7 @@
 // Trigonometric Key Cache Eviction for Long-Context LLM Inference" (2604.04921)
 
 #include "llama-triattention.h"
+#include "llama-triattention-file.h"
 #include "llama-kv-cache.h"
 #include "llama-hparams.h"
 #include "ggml.h"
@@ -68,6 +69,58 @@ extern "C" {
     void dequantize_row_q8_0(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 }
 
+#if !defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+extern "C" {
+    triattention_gpu_state * triattention_gpu_init(
+        const struct triattention_gpu_config *,
+        const struct triattention_gpu_head_calib *,
+        const float *,
+        const float *,
+        const float *,
+        void *) {
+        return nullptr;
+    }
+
+    void triattention_gpu_score_head(
+        triattention_gpu_state *,
+        const void *,
+        uint64_t,
+        size_t,
+        uint32_t,
+        uint32_t,
+        const uint32_t *,
+        const int32_t *,
+        uint32_t,
+        int64_t,
+        int,
+        float *,
+        void *) {
+    }
+
+    void triattention_gpu_scores_to_host(float *, const float *, uint32_t, void *) {
+    }
+
+    void triattention_gpu_upload_cells(
+        uint32_t **,
+        int32_t **,
+        const uint32_t *,
+        const int32_t *,
+        uint32_t,
+        void *) {
+    }
+
+    float * triattention_gpu_alloc_scores(uint32_t, void *) {
+        return nullptr;
+    }
+
+    void triattention_gpu_free_dev(void *) {
+    }
+
+    void triattention_gpu_free(triattention_gpu_state *) {
+    }
+}
+#endif
+
 // ============================================================================
 // Internal helpers
 // ============================================================================
@@ -85,6 +138,8 @@ static double triattention_time_ms(void) {
 #endif
 }
 
+static void minmax_normalize(float * scores, uint32_t n);
+
 // Matrix-vector multiply: out[i] = sum_j mat[i*d + j] * vec[j]
 // Used for inverse WHT rotation on turbo2/turbo3 dequant output
 static void matvec_128(const float * mat, const float * vec, float * out) {
@@ -95,236 +150,6 @@ static void matvec_128(const float * mat, const float * vec, float * out) {
             sum += row[j] * vec[j];
         }
         out[i] = sum;
-    }
-}
-
-// ============================================================================
-// Binary calibration file I/O
-// ============================================================================
-
-// Load .triattention calibration file
-// Returns nullptr on any error, with diagnostic printed to stderr
-static triattention_calibration * triattention_load_calibration(const char * path) {
-    FILE * f = fopen(path, "rb");
-    if (!f) {
-        fprintf(stderr, "[TriAttention] ERROR: cannot open calibration file: %s\n", path);
-        return nullptr;
-    }
-
-    // Read and validate magic
-    uint32_t magic;
-    if (fread(&magic, sizeof(uint32_t), 1, f) != 1 || magic != TRIATTENTION_MAGIC) {
-        fprintf(stderr, "[TriAttention] ERROR: invalid magic in %s (got 0x%08x, expected 0x%08x)\n",
-                path, magic, TRIATTENTION_MAGIC);
-        fclose(f);
-        return nullptr;
-    }
-
-    // Read and validate version
-    uint32_t version;
-    if (fread(&version, sizeof(uint32_t), 1, f) != 1 || version != TRIATTENTION_VERSION) {
-        fprintf(stderr, "[TriAttention] ERROR: unsupported version %u in %s (expected %u)\n",
-                version, path, TRIATTENTION_VERSION);
-        fclose(f);
-        return nullptr;
-    }
-
-    auto * cal = new triattention_calibration();
-    memset(cal, 0, sizeof(triattention_calibration));
-
-    // Read header fields
-    bool ok = true;
-    ok = ok && fread(&cal->head_dim,        sizeof(uint32_t), 1, f) == 1;
-    ok = ok && fread(&cal->num_layers,      sizeof(uint32_t), 1, f) == 1;
-    ok = ok && fread(&cal->num_attn_heads,  sizeof(uint32_t), 1, f) == 1;
-    ok = ok && fread(&cal->num_kv_heads,    sizeof(uint32_t), 1, f) == 1;
-    ok = ok && fread(&cal->rope_theta,      sizeof(double),   1, f) == 1;
-    ok = ok && fread(&cal->rope_style,      sizeof(uint32_t), 1, f) == 1;
-    ok = ok && fread(&cal->n_sampled,       sizeof(uint32_t), 1, f) == 1;
-    ok = ok && fread(&cal->freq_count,      sizeof(uint32_t), 1, f) == 1;
-
-    if (!ok) {
-        fprintf(stderr, "[TriAttention] ERROR: truncated header in %s\n", path);
-        delete cal;
-        fclose(f);
-        return nullptr;
-    }
-
-    // Read model name
-    uint32_t name_len;
-    if (fread(&name_len, sizeof(uint32_t), 1, f) != 1 || name_len == 0 || name_len > 255) {
-        fprintf(stderr, "[TriAttention] ERROR: invalid model name length %u in %s\n", name_len, path);
-        delete cal;
-        fclose(f);
-        return nullptr;
-    }
-    if (fread(cal->model_name, 1, name_len, f) != name_len) {
-        fprintf(stderr, "[TriAttention] ERROR: truncated model name in %s\n", path);
-        delete cal;
-        fclose(f);
-        return nullptr;
-    }
-    cal->model_name[name_len] = '\0';
-
-    // Validate basic field consistency
-    if (cal->freq_count != cal->head_dim / 2) {
-        fprintf(stderr, "[TriAttention] ERROR: freq_count (%u) != head_dim/2 (%u) in %s\n",
-                cal->freq_count, cal->head_dim / 2, path);
-        delete cal;
-        fclose(f);
-        return nullptr;
-    }
-
-    if (cal->num_attn_heads == 0 || cal->num_kv_heads == 0 ||
-        cal->num_attn_heads % cal->num_kv_heads != 0) {
-        fprintf(stderr, "[TriAttention] ERROR: invalid head counts (attn=%u, kv=%u) in %s\n",
-                cal->num_attn_heads, cal->num_kv_heads, path);
-        delete cal;
-        fclose(f);
-        return nullptr;
-    }
-
-    cal->num_kv_groups = cal->num_attn_heads / cal->num_kv_heads;
-
-    // Allocate per-head arrays
-    cal->sampled_layer = new uint32_t[cal->n_sampled];
-    cal->sampled_head  = new uint32_t[cal->n_sampled];
-    cal->head_stats    = new triattention_head_stats[cal->n_sampled];
-
-    const uint32_t fc = cal->freq_count;
-
-    for (uint32_t h = 0; h < cal->n_sampled; h++) {
-        // Read layer and head indices
-        ok = true;
-        ok = ok && fread(&cal->sampled_layer[h], sizeof(uint32_t), 1, f) == 1;
-        ok = ok && fread(&cal->sampled_head[h],  sizeof(uint32_t), 1, f) == 1;
-
-        if (!ok) {
-            fprintf(stderr, "[TriAttention] ERROR: truncated head entry %u in %s\n", h, path);
-            // Cleanup partially allocated heads
-            for (uint32_t j = 0; j < h; j++) {
-                delete[] cal->head_stats[j].q_mean_real;
-                delete[] cal->head_stats[j].q_mean_imag;
-                delete[] cal->head_stats[j].q_abs_mean;
-            }
-            delete[] cal->sampled_layer;
-            delete[] cal->sampled_head;
-            delete[] cal->head_stats;
-            delete cal;
-            fclose(f);
-            return nullptr;
-        }
-
-        // Validate indices
-        if (cal->sampled_layer[h] >= cal->num_layers ||
-            cal->sampled_head[h] >= cal->num_attn_heads) {
-            fprintf(stderr, "[TriAttention] ERROR: head entry %u has invalid indices (layer=%u, head=%u) in %s\n",
-                    h, cal->sampled_layer[h], cal->sampled_head[h], path);
-            for (uint32_t j = 0; j < h; j++) {
-                delete[] cal->head_stats[j].q_mean_real;
-                delete[] cal->head_stats[j].q_mean_imag;
-                delete[] cal->head_stats[j].q_abs_mean;
-            }
-            delete[] cal->sampled_layer;
-            delete[] cal->sampled_head;
-            delete[] cal->head_stats;
-            delete cal;
-            fclose(f);
-            return nullptr;
-        }
-
-        // Allocate and read per-frequency arrays
-        auto & hs = cal->head_stats[h];
-        hs.q_mean_real  = new float[fc];
-        hs.q_mean_imag  = new float[fc];
-        hs.q_abs_mean   = new float[fc];
-        hs.q_mean_abs   = nullptr;  // computed at init time
-        hs.extra_weight = nullptr;  // computed at init time
-
-        ok = true;
-        ok = ok && fread(hs.q_mean_real, sizeof(float), fc, f) == fc;
-        ok = ok && fread(hs.q_mean_imag, sizeof(float), fc, f) == fc;
-        ok = ok && fread(hs.q_abs_mean,  sizeof(float), fc, f) == fc;
-
-        // Read R_f (validation data — not stored at runtime, just skip)
-        float * r_f_tmp = new float[fc];
-        ok = ok && fread(r_f_tmp, sizeof(float), fc, f) == fc;
-        delete[] r_f_tmp;
-
-        if (!ok) {
-            fprintf(stderr, "[TriAttention] ERROR: truncated stats for head %u in %s\n", h, path);
-            // Free this head's arrays
-            delete[] hs.q_mean_real;
-            delete[] hs.q_mean_imag;
-            delete[] hs.q_abs_mean;
-            // Free previous heads
-            for (uint32_t j = 0; j < h; j++) {
-                delete[] cal->head_stats[j].q_mean_real;
-                delete[] cal->head_stats[j].q_mean_imag;
-                delete[] cal->head_stats[j].q_abs_mean;
-                delete[] cal->head_stats[j].q_mean_abs;
-                delete[] cal->head_stats[j].extra_weight;
-            }
-            delete[] cal->sampled_layer;
-            delete[] cal->sampled_head;
-            delete[] cal->head_stats;
-            delete cal;
-            fclose(f);
-            return nullptr;
-        }
-    }
-
-    fclose(f);
-
-    fprintf(stderr, "[TriAttention] Loaded calibration: model=%s, layers=%u, attn_heads=%u, kv_heads=%u, "
-            "head_dim=%u, sampled=%u, rope_theta=%.1f\n",
-            cal->model_name, cal->num_layers, cal->num_attn_heads,
-            cal->num_kv_heads, cal->head_dim, cal->n_sampled, cal->rope_theta);
-
-    return cal;
-}
-
-static void triattention_free_calibration(triattention_calibration * cal) {
-    if (!cal) return;
-
-    for (uint32_t h = 0; h < cal->n_sampled; h++) {
-        delete[] cal->head_stats[h].q_mean_real;
-        delete[] cal->head_stats[h].q_mean_imag;
-        delete[] cal->head_stats[h].q_abs_mean;
-        delete[] cal->head_stats[h].q_mean_abs;
-        delete[] cal->head_stats[h].extra_weight;
-    }
-    delete[] cal->sampled_layer;
-    delete[] cal->sampled_head;
-    delete[] cal->head_stats;
-    delete cal;
-}
-
-// ============================================================================
-// Precomputation at init time
-// ============================================================================
-
-// Build RoPE frequency array: omega[f] = rope_theta^(-2f/head_dim)
-// Paper Eq. 1: theta_f = base^{-2f/d}
-static void triattention_build_omega(float * omega, uint32_t freq_count, uint32_t head_dim, double rope_theta) {
-    for (uint32_t f = 0; f < freq_count; f++) {
-        double exponent = -2.0 * (double)f / (double)head_dim;
-        omega[f] = (float)pow(rope_theta, exponent);
-    }
-}
-
-// Build frequency scaling squared: freq_scale_sq[f] = cos^2(omega[f]*0) + sin^2(omega[f]*0)
-// For standard RoPE this is always 1.0, but for scaled RoPE (YaRN etc.)
-// the scaling factors at position 0 capture any frequency-dependent scaling.
-// Paper Section 3.2: "frequency scaling factor"
-static void triattention_build_freq_scale_sq(float * freq_scale_sq, const float * omega, uint32_t freq_count) {
-    for (uint32_t f = 0; f < freq_count; f++) {
-        // At position 0: cos(omega*0)=1, sin(omega*0)=0
-        // So freq_scale_sq = 1.0 for all standard RoPE variants.
-        // If we later support YaRN scaling, this would use the actual scaling factors.
-        float c = cosf(omega[f] * 0.0f);
-        float s = sinf(omega[f] * 0.0f);
-        freq_scale_sq[f] = c * c + s * s;
     }
 }
 
@@ -407,15 +232,17 @@ void triattention_invert_rope(
                 dst[f + freq_count] = im * c - re * s;
             }
         } else {
-            // Interleaved style: [re_0, im_0, re_1, im_1, ...]
+            // Interleaved source layout: [re_0, im_0, re_1, im_1, ...]
+            // Output is converted to the shared "half" layout expected by the scorer:
+            // [real_0..real_{fc-1} | imag_0..imag_{fc-1}]
             for (uint32_t f = 0; f < freq_count; f++) {
                 float angle = omega[f] * pos;
                 float c = cosf(angle);
                 float s = sinf(angle);
                 float re = src[2 * f];
                 float im = src[2 * f + 1];
-                dst[2 * f]     = re * c + im * s;
-                dst[2 * f + 1] = im * c - re * s;
+                dst[f]              = re * c + im * s;
+                dst[f + freq_count] = im * c - re * s;
             }
         }
     }
@@ -513,6 +340,64 @@ void triattention_score_keys(
         }
 
         out_scores[i] = total_score;
+    }
+}
+
+void triattention_score_keys_norm(
+    float       * out_scores,
+    const float * pre_rope_k,
+    const float * freq_scale_sq,
+    uint32_t n_keys,
+    uint32_t head_dim,
+    uint32_t freq_count) {
+    for (uint32_t i = 0; i < n_keys; ++i) {
+        const float * k = pre_rope_k + (size_t) i * head_dim;
+        float total = 0.0f;
+        for (uint32_t f = 0; f < freq_count; ++f) {
+            const float re = k[f];
+            const float im = k[f + freq_count];
+            const float mag = sqrtf(re * re + im * im);
+            total += freq_scale_sq[f] * mag;
+        }
+        out_scores[i] = total;
+    }
+}
+
+void triattention_build_recency_scores(
+    float         * out_scores,
+    const int32_t * key_positions,
+    uint32_t        n_keys) {
+    if (!out_scores || !key_positions || n_keys == 0) {
+        return;
+    }
+
+    int32_t min_pos = key_positions[0];
+    int32_t max_pos = key_positions[0];
+    for (uint32_t i = 1; i < n_keys; ++i) {
+        min_pos = std::min(min_pos, key_positions[i]);
+        max_pos = std::max(max_pos, key_positions[i]);
+    }
+
+    const float max_age = (float) std::max<int32_t>(1, max_pos - min_pos);
+    for (uint32_t i = 0; i < n_keys; ++i) {
+        const float age = (float) (max_pos - key_positions[i]);
+        out_scores[i] = 1.0f - age / max_age;
+    }
+}
+
+void triattention_blend_fallback_scores(
+    float       * scores,
+    const float * recency_scores,
+    uint32_t      n_keys,
+    float         lambda) {
+    if (!scores || !recency_scores || n_keys == 0) {
+        return;
+    }
+
+    lambda = fminf(1.0f, fmaxf(0.0f, lambda));
+    minmax_normalize(scores, n_keys);
+    for (uint32_t i = 0; i < n_keys; ++i) {
+        scores[i] = (1.0f - lambda) * scores[i] + lambda * recency_scores[i];
     }
 }
 
@@ -630,76 +515,110 @@ static void triattention_dequant_kv_head(
 triattention_state * triattention_init(
     const char * stats_path,
     const triattention_config * cfg,
-    uint32_t kv_size,
-    double   rope_theta,
-    uint32_t head_dim,
-    uint32_t n_kv_heads)
+    const triattention_model_params * model)
 {
-    // Load calibration file
-    triattention_calibration * cal = triattention_load_calibration(stats_path);
-    if (!cal) {
+    if (!cfg || !model) {
         return nullptr;
     }
 
-    // Validate model compatibility
-    if (cal->head_dim != head_dim) {
-        fprintf(stderr, "[TriAttention] ERROR: head_dim mismatch (calibration=%u, model=%u)\n",
-                cal->head_dim, head_dim);
-        triattention_free_calibration(cal);
-        return nullptr;
-    }
-    if (cal->num_kv_heads != n_kv_heads) {
-        fprintf(stderr, "[TriAttention] ERROR: n_kv_heads mismatch (calibration=%u, model=%u)\n",
-                cal->num_kv_heads, n_kv_heads);
-        triattention_free_calibration(cal);
-        return nullptr;
-    }
-    // Warn if rope_theta differs significantly (>1% relative)
-    if (fabs(cal->rope_theta - rope_theta) / fmax(cal->rope_theta, 1.0) > 0.01) {
-        fprintf(stderr, "[TriAttention] WARNING: rope_theta mismatch (calibration=%.1f, model=%.1f)\n",
-                cal->rope_theta, rope_theta);
+    triattention_calibration * cal = nullptr;
+    bool fallback_active = false;
+
+    if (stats_path && stats_path[0] != '\0') {
+        cal = triattention_calibration_load(stats_path);
+        if (!cal) {
+            return nullptr;
+        }
+        if (!triattention_calibration_validate(cal, model, true)) {
+            triattention_calibration_free(cal);
+            return nullptr;
+        }
+    } else {
+        if (cfg->fallback_mode == TRIATTENTION_FALLBACK_OFF) {
+            fprintf(stderr, "[TriAttention] ERROR: no calibration file was provided and fallback is disabled\n");
+            return nullptr;
+        }
+        if (cfg->fallback_mode != TRIATTENTION_FALLBACK_AUTO &&
+            cfg->fallback_mode != TRIATTENTION_FALLBACK_HYBRID_NORM_RECENCY) {
+            fprintf(stderr, "[TriAttention] ERROR: unsupported fallback mode %d\n", (int) cfg->fallback_mode);
+            return nullptr;
+        }
+
+        cal = triattention_calibration_create_fallback(model);
+        if (!cal) {
+            fprintf(stderr, "[TriAttention] ERROR: failed to construct runtime fallback state\n");
+            return nullptr;
+        }
+        fallback_active = true;
     }
 
     // Allocate state
     auto * state = new triattention_state();
     memset(state, 0, sizeof(triattention_state));
 
-    state->cal  = cal;
-    state->cfg  = *cfg;
-    state->kv_size = kv_size;
+    state->cal = cal;
+    state->cfg = *cfg;
+    state->cfg.fallback_recency_weight = fminf(1.0f, fmaxf(0.0f, state->cfg.fallback_recency_weight));
+    state->model = *model;
+    state->fallback_active = fallback_active;
+    state->kv_size = model->kv_size;
     state->absolute_position = 0;
     state->prefix_length     = 0;
 
     const uint32_t fc = cal->freq_count;
+    const uint32_t hd = cal->head_dim;
 
-    // Build precomputed arrays
     state->omega = new float[fc];
-    triattention_build_omega(state->omega, fc, head_dim, rope_theta);
-
     state->freq_scale_sq = new float[fc];
-    triattention_build_freq_scale_sq(state->freq_scale_sq, state->omega, fc);
+    if (cal->omega && cal->freq_scale_sq) {
+        memcpy(state->omega, cal->omega, sizeof(float) * fc);
+        memcpy(state->freq_scale_sq, cal->freq_scale_sq, sizeof(float) * fc);
+    } else {
+        triattention_rope_params rope_params = {
+            /*.n_dims            =*/ hd,
+            /*.n_ctx_orig        =*/ model->n_ctx_orig,
+            /*.freq_base         =*/ (float) model->rope_theta,
+            /*.freq_scale        =*/ model->rope_freq_scale,
+            /*.ext_factor        =*/ model->rope_ext_factor,
+            /*.attn_factor       =*/ model->rope_attn_factor,
+            /*.beta_fast         =*/ model->rope_beta_fast,
+            /*.beta_slow         =*/ model->rope_beta_slow,
+            /*.freq_factors      =*/ nullptr,
+            /*.freq_factor_count =*/ 0,
+        };
+
+        if (!triattention_build_rope_arrays(state->omega, state->freq_scale_sq, fc, &rope_params)) {
+            for (uint32_t f = 0; f < fc; ++f) {
+                const double exponent = -2.0 * (double) f / (double) hd;
+                state->omega[f] = (float) pow(model->rope_theta, exponent);
+                state->freq_scale_sq[f] = 1.0f;
+            }
+        }
+    }
 
     // Geometric offsets — max 17 elements for offset_max=65536
     state->offsets = new float[32];  // generous allocation
     state->n_offsets = triattention_build_offsets(state->offsets, cfg->offset_max);
 
     // Precompute derived head stats
-    for (uint32_t h = 0; h < cal->n_sampled; h++) {
-        triattention_precompute_head_derived(&cal->head_stats[h], fc, cfg->disable_mlr);
+    if (!fallback_active) {
+        for (uint32_t h = 0; h < cal->n_sampled; h++) {
+            triattention_precompute_head_derived(&cal->head_stats[h], fc, cfg->disable_mlr);
+        }
     }
 
     // Allocate cell position tracking
-    state->cell_positions = new int32_t[kv_size];
-    for (uint32_t i = 0; i < kv_size; i++) {
+    state->cell_positions = new int32_t[state->kv_size];
+    for (uint32_t i = 0; i < state->kv_size; i++) {
         state->cell_positions[i] = -1;
     }
 
     // Allocate scratch buffers
     // These are sized for worst-case (scoring all cells)
-    state->dequant_buf  = new float[(size_t)kv_size * head_dim];
-    state->unrot_buf    = new float[(size_t)kv_size * head_dim];
-    state->score_buf    = new float[(size_t)cal->n_sampled * kv_size];
-    state->combined_buf = new float[kv_size];
+    state->dequant_buf  = new float[(size_t)state->kv_size * hd];
+    state->unrot_buf    = new float[(size_t)state->kv_size * hd];
+    state->score_buf    = new float[(size_t)cal->n_sampled * state->kv_size];
+    state->combined_buf = new float[state->kv_size];
     state->keep_indices = new uint32_t[cfg->budget];
 
     // Init monitoring
@@ -708,10 +627,11 @@ triattention_state * triattention_init(
     state->total_prune_time_ms = 0.0;
     state->last_prune_time_ms  = 0.0;
 
-    fprintf(stderr, "[TriAttention] Initialized: budget=%u, window=%u, mode=%d, offsets=%u, "
+    fprintf(stderr, "[TriAttention] Initialized: %s, budget=%u, window=%u, mode=%d, offsets=%u, "
             "kv_size=%u, sampled_heads=%u\n",
+            fallback_active ? "experimental fallback" : "calibrated",
             cfg->budget, cfg->divide_length, (int)cfg->mode,
-            state->n_offsets, kv_size, cal->n_sampled);
+            state->n_offsets, state->kv_size, cal->n_sampled);
 
     return state;
 }
@@ -719,7 +639,7 @@ triattention_state * triattention_init(
 void triattention_free(triattention_state * state) {
     if (!state) return;
 
-    triattention_free_calibration(state->cal);
+    triattention_calibration_free(state->cal);
 
     delete[] state->omega;
     delete[] state->freq_scale_sq;
@@ -846,6 +766,31 @@ static void zscore_normalize(float * scores, uint32_t n) {
     }
 }
 
+static void minmax_normalize(float * scores, uint32_t n) {
+    if (n == 0) {
+        return;
+    }
+
+    float min_score = scores[0];
+    float max_score = scores[0];
+    for (uint32_t i = 1; i < n; ++i) {
+        min_score = fminf(min_score, scores[i]);
+        max_score = fmaxf(max_score, scores[i]);
+    }
+
+    const float denom = max_score - min_score;
+    if (denom <= 1e-10f) {
+        for (uint32_t i = 0; i < n; ++i) {
+            scores[i] = 1.0f;
+        }
+        return;
+    }
+
+    for (uint32_t i = 0; i < n; ++i) {
+        scores[i] = (scores[i] - min_score) / denom;
+    }
+}
+
 // Helper: partial argsort — find top-K indices by score (descending)
 // Returns indices of the K highest-scoring elements
 static void top_k_indices(
@@ -885,6 +830,9 @@ static void top_k_indices(
 static void triattention_init_gpu(triattention_state * state, ggml_type k_type) {
     if (state->gpu_init_tried) return;
     state->gpu_init_tried = true;
+    if (state->fallback_active) {
+        return;
+    }
 
     const triattention_calibration * cal = state->cal;
     const triattention_config & cfg = state->cfg;
@@ -1163,7 +1111,7 @@ int32_t triattention_prune_impl(
         triattention_init_gpu(state, k_type);
     }
 
-    if (state->use_gpu) {
+    if (state->use_gpu && !state->fallback_active) {
         // ---- GPU path ----
         // Upload the n_decode candidate cell indices + positions to device.
         // Kernels are enqueued into the default stream (nullptr), ordered after the upload.
@@ -1283,21 +1231,45 @@ int32_t triattention_prune_impl(
                 cal->rope_style);
 
             // 3c. Score keys
-            triattention_score_keys(
-                score_buf + (size_t)sh * n_decode,
-                state->unrot_buf,
-                &cal->head_stats[sh],
-                state->omega,
-                state->freq_scale_sq,
-                state->offsets,
-                decode_positions.data(),
-                state->absolute_position,
+            if (state->fallback_active) {
+                triattention_score_keys_norm(
+                    score_buf + (size_t)sh * n_decode,
+                    state->unrot_buf,
+                    state->freq_scale_sq,
+                    n_decode,
+                    padded_hd,
+                    fc);
+            } else {
+                triattention_score_keys(
+                    score_buf + (size_t)sh * n_decode,
+                    state->unrot_buf,
+                    &cal->head_stats[sh],
+                    state->omega,
+                    state->freq_scale_sq,
+                    state->offsets,
+                    decode_positions.data(),
+                    state->absolute_position,
+                    n_decode,
+                    padded_hd,
+                    fc,
+                    state->n_offsets,
+                    cfg.agg,
+                    cfg.disable_trig);
+            }
+        }
+    }
+
+    std::vector<float> recency_scores;
+    if (state->fallback_active) {
+        recency_scores.resize(n_decode);
+        triattention_build_recency_scores(recency_scores.data(), decode_positions.data(), n_decode);
+        for (uint32_t sh = 0; sh < cal->n_sampled; ++sh) {
+            float * row = score_buf + (size_t) sh * n_decode;
+            triattention_blend_fallback_scores(
+                row,
+                recency_scores.data(),
                 n_decode,
-                padded_hd,
-                fc,
-                state->n_offsets,
-                cfg.agg,
-                cfg.disable_trig);
+                state->cfg.fallback_recency_weight);
         }
     }
 
@@ -1307,7 +1279,7 @@ int32_t triattention_prune_impl(
     if (cfg.mode == TRIATTENTION_MODE_GLOBAL) {
         // ---- Global union-based selection (Paper default) ----
         // 4a. Z-score normalize per head
-        if (cfg.normalize_scores) {
+        if (cfg.normalize_scores && !state->fallback_active) {
             for (uint32_t sh = 0; sh < cal->n_sampled; sh++) {
                 zscore_normalize(score_buf + (size_t)sh * n_decode, n_decode);
             }
@@ -1380,7 +1352,7 @@ int32_t triattention_prune_impl(
         }
 
         // Normalize if requested
-        if (cfg.normalize_scores) {
+        if (cfg.normalize_scores && !state->fallback_active) {
             // Per-KV-head z-score normalization on the per-head scores
             for (uint32_t sh = 0; sh < cal->n_sampled; sh++) {
                 zscore_normalize(score_buf + (size_t)sh * n_decode, n_decode);
@@ -1403,7 +1375,7 @@ int32_t triattention_prune_impl(
         // Each (layer, KV head) selects independently.
         // Final combined score = mean of per-(layer,kv_head) scores
 
-        if (cfg.normalize_scores) {
+        if (cfg.normalize_scores && !state->fallback_active) {
             for (uint32_t sh = 0; sh < cal->n_sampled; sh++) {
                 zscore_normalize(score_buf + (size_t)sh * n_decode, n_decode);
             }
@@ -1466,6 +1438,7 @@ void triattention_print_stats(const triattention_state * state, FILE * stream) {
 
     fprintf(stream, "\n=== TriAttention Statistics ===\n");
     fprintf(stream, "  Model:            %s\n", state->cal->model_name);
+    fprintf(stream, "  Runtime mode:     %s\n", state->fallback_active ? "experimental fallback" : "calibrated");
     fprintf(stream, "  Budget:           %u tokens\n", state->cfg.budget);
     fprintf(stream, "  Pruning interval: %u tokens\n", state->cfg.divide_length);
     fprintf(stream, "  Pruning mode:     %s\n",
@@ -1475,6 +1448,9 @@ void triattention_print_stats(const triattention_state * state, FILE * stream) {
     fprintf(stream, "  Score aggregation: %s\n",
             state->cfg.agg == TRIATTENTION_AGG_MEAN ? "mean" : "max");
     fprintf(stream, "  Sampled heads:    %u of %u\n", state->cal->n_sampled, state->cal->num_attn_heads);
+    if (state->fallback_active) {
+        fprintf(stream, "  Fallback lambda:  %.3f\n", state->cfg.fallback_recency_weight);
+    }
     fprintf(stream, "  Geometric offsets: %u (max %u)\n", state->n_offsets, state->cfg.offset_max);
     fprintf(stream, "  ---\n");
     fprintf(stream, "  Total prune calls:    %llu\n", (unsigned long long)state->total_prune_calls);

@@ -1236,10 +1236,10 @@ common_init_result::common_init_result(common_params & params) :
         return;
     }
 
-    // Initialize TriAttention KV cache eviction if calibration stats provided
-    if (!params.triattention_stats.empty()) {
+    // Initialize TriAttention KV cache eviction if requested.
+    if (params.triattention_requested || !params.triattention_stats.empty()) {
         int32_t rc = llama_triattention_init(lctx,
-            params.triattention_stats.c_str(),
+            params.triattention_stats.empty() ? nullptr : params.triattention_stats.c_str(),
             params.triattention_budget,
             params.triattention_window,
             params.triattention_offset_max,
@@ -1251,10 +1251,16 @@ common_init_result::common_init_result(common_params & params) :
             params.triattention_protect_prefill,
             params.triattention_disable_mlr,
             params.triattention_disable_trig,
-            params.triattention_log);
+            params.triattention_log,
+            params.triattention_fallback,
+            params.triattention_fallback_recency_weight);
         if (rc != 0) {
-            LOG_WRN("%s: TriAttention initialization failed (stats=%s) — continuing without eviction\n",
-                    __func__, params.triattention_stats.c_str());
+            LOG_ERR("%s: TriAttention initialization failed (stats=%s, fallback=%d)\n",
+                    __func__,
+                    params.triattention_stats.empty() ? "<none>" : params.triattention_stats.c_str(),
+                    params.triattention_fallback);
+            llama_free(lctx);
+            return;
         }
     }
 

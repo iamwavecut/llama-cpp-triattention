@@ -29,7 +29,16 @@ Download the latest Release build (Windows x64, CUDA 13, RTX 2000+) from Hugging
 
 ## TriAttention
 
-TriAttention keeps your KV cache within a fixed token budget by periodically scoring all cached tokens and evicting the least important ones. Scoring uses the geometric structure of RoPE-encoded key vectors — no additional model weights or fine-tuning required.
+TriAttention keeps the KV cache within a fixed token budget by periodically scoring cached tokens and evicting the least important ones.
+
+There are now two runtime modes:
+
+| Mode | Status | What it needs |
+|------|--------|---------------|
+| `calibrated` | Canonical | A `.triattention` file built from a representative text corpus |
+| `experimental fallback` | Heuristic | No calibration file; runtime uses norm+recency scoring |
+
+Calibration remains the paper-aligned path. The fallback mode exists so inference can still run without precomputed query statistics, but it is not equivalent to the method described in the paper.
 
 ### Performance (Qwen3-8B Q4\_K\_M, RTX 3080, `-c 512`)
 
@@ -44,39 +53,66 @@ GPU scoring is ~1,000× faster than CPU. The 4.3× generation speedup comes from
 ### Quick start
 
 ```bash
-llama-server.exe -m YourModel.gguf -c 32768 -ngl 99 --port 8080 \
+cmake --build build --target llama-server llama-triattention-calibrate -j
+```
+
+Build a calibration file from a plain-text corpus:
+
+```bash
+./build/bin/llama-triattention-calibrate -m YourModel.gguf -f corpus.txt -o model.triattention \
+  -c 8192 -b 2048
+```
+
+Inspect or validate the resulting file:
+
+```bash
+./build/bin/llama-triattention-calibrate --inspect model.triattention
+./build/bin/llama-triattention-calibrate --validate model.triattention -m YourModel.gguf
+```
+
+Run calibrated TriAttention:
+
+```bash
+./build/bin/llama-server -m YourModel.gguf -c 32768 -ngl 99 --port 8080 \
   --triattention-stats model.triattention \
   --triattention-budget 4096 \
   --triattention-window 256 \
   --triattention-log
 ```
 
-A `.triattention` calibration file is required. Generate one from a representative text corpus:
+Run experimental fallback without a stats file:
 
 ```bash
-llama-cli.exe -m YourModel.gguf -ngl 99 \
-  --triattention-calibrate corpus.txt \
-  --triattention-calibrate-out model.triattention
+./build/bin/llama-server -m YourModel.gguf -c 32768 -ngl 99 --port 8080 \
+  --triattention-fallback auto \
+  --triattention-budget 4096 \
+  --triattention-window 256 \
+  --triattention-log
 ```
 
 ### CLI flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--triattention-stats <file>` | *(none)* | Calibration file — **required to enable TriAttention** |
+| `--triattention-stats <file>` | *(none)* | Calibration file. Preferred path; when omitted, runtime can fall back to the experimental heuristic |
 | `--triattention-budget <n>` | `512` | Maximum KV tokens to retain after each prune |
-| `--triattention-window <n>` | `64` | Most-recent N tokens always protected from eviction |
-| `--triattention-trigger <mode>` | `slack` | When to prune: `slack` (budget+window), `interval`, `fill` |
+| `--triattention-window <n>` | `64` | Pruning interval in decode tokens; the most recent `N` positions are also protected |
+| `--triattention-offset-max <n>` | `65536` | Maximum geometric offset used by trig scoring |
+| `--triattention-mode <mode>` | `global` | `global`, `per-kv-head`, or `per-layer-head` |
+| `--triattention-trigger <mode>` | `interval` | `interval` or `slack` |
+| `--triattention-agg <mode>` | `mean` | `mean` or `max` aggregation over geometric offsets |
+| `--triattention-fallback <mode>` | `auto` | `auto`, `off`, or `hybrid-norm-recency` |
+| `--triattention-fallback-recency-weight <f>` | `0.25` | Blend factor for the fallback recency term |
 | `--triattention-log` | off | Print a line for each prune event |
 | `--triattention-no-protect-prefill` | off | Allow evicting prompt (prefill) tokens |
 
 ### How it works
 
-1. When occupied KV cells exceed `budget + window` (SLACK mode), a prune is triggered
-2. The most recent `window` positions and all prefix/prompt tokens are protected
-3. For each sampled `(layer, head)` pair, key vectors are read from the KV cache, RoPE rotation is inverted, and a geometric offset score is computed on the GPU
-4. The top-`budget` tokens by importance score are kept; the rest are evicted
-5. Position gaps left by evicted tokens are harmless — RoPE handles non-contiguous positions natively
+1. A prune is triggered either every `window` decode tokens or once occupancy reaches `budget + window`, depending on `--triattention-trigger`
+2. Prefix tokens can be protected, and the most recent `window` positions are always protected
+3. In calibrated mode, cached keys are scored against offline query statistics collected from pre-RoPE `Q`
+4. In fallback mode, cached keys are scored with a norm+recency heuristic using the same RoPE-inverted key path
+5. The top-`budget` positions are kept and the rest are evicted
 
 ---
 
@@ -130,7 +166,8 @@ cmake --build build --target llama-server -j$(nproc)
 
 | Branch | Description |
 |--------|-------------|
-| `feature/triattention` | **Default** — TurboQuant + TriAttention (latest) |
+| `triattention` | **Default in this mirror** — TurboQuant + TriAttention |
+| `feature/triattention` | Upstream branch with TriAttention development |
 | `feature/turboquant-kv-cache` | TurboQuant base (pre-TriAttention) |
 | `master` | Upstream llama.cpp base |
 

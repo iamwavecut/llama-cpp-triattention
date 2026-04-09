@@ -786,7 +786,7 @@ extern "C" {
     //
 
     // Initialize TriAttention on the context's KV cache.
-    // stats_path: path to .triattention binary calibration file
+    // stats_path: path to .triattention binary calibration file (optional when fallback is enabled)
     // budget: max KV entries to retain after pruning
     // divide_length: pruning interval in tokens
     // offset_max: max geometric offset for scoring
@@ -794,6 +794,7 @@ extern "C" {
     // trigger: 0=interval, 1=slack
     // agg: 0=mean, 1=max
     // seed: RNG seed for tie-breaking noise (-1 to disable)
+    // fallback_mode: 0=off, 1=auto, 2=hybrid-norm-recency
     // Returns 0 on success, -1 on failure.
     LLAMA_API int32_t llama_triattention_init(
             struct llama_context * ctx,
@@ -809,7 +810,9 @@ extern "C" {
                             bool   protect_prefill,
                             bool   disable_mlr,
                             bool   disable_trig,
-                            bool   enable_logging);
+                            bool   enable_logging,
+                         int32_t   fallback_mode,
+                            float   fallback_recency_weight);
 
     //
     // State / sessions

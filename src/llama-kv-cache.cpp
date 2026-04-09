@@ -87,6 +87,15 @@ GGML_API int   turbo_innerq_needs_tensor_update(void);
 GGML_API void  turbo_innerq_mark_tensor_updated(void);
 }
 
+#if !defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+extern "C" {
+GGML_API bool  g_innerq_finalized = false;
+GGML_API float g_innerq_scale_inv_host[INNERQ_MAX_CHANNELS] = { 0.0f };
+GGML_API int   turbo_innerq_needs_tensor_update(void) { return 0; }
+GGML_API void  turbo_innerq_mark_tensor_updated(void) {}
+}
+#endif
+
 //
 // llama_kv_cache
 //
@@ -2618,8 +2627,8 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 // llama_kv_cache: TriAttention integration
 //
 
-void llama_kv_cache::init_triattention(const char * stats_path, const triattention_config * cfg) {
-    if (!stats_path || stats_path[0] == '\0') {
+void llama_kv_cache::init_triattention(const char * stats_path, const triattention_config * cfg, const triattention_model_params * model_params) {
+    if (!cfg || !model_params) {
         return;
     }
     if (triattention_st) {
@@ -2627,14 +2636,10 @@ void llama_kv_cache::init_triattention(const char * stats_path, const triattenti
         triattention_st = nullptr;
     }
 
-    const uint32_t kv_size = v_cells.empty() ? 0 : (uint32_t)v_cells[0].size();
-    const double rope_theta = (double)hparams.rope_freq_base_train;
-    const uint32_t head_dim = hparams.n_embd_head_k(0);
-    const uint32_t n_kv_heads = hparams.n_head_kv(0);
-
-    triattention_st = triattention_init(stats_path, cfg, kv_size, rope_theta, head_dim, n_kv_heads);
+    triattention_st = triattention_init(stats_path, cfg, model_params);
     if (!triattention_st) {
-        LLAMA_LOG_ERROR("%s: failed to initialize TriAttention from %s\n", __func__, stats_path);
+        LLAMA_LOG_ERROR("%s: failed to initialize TriAttention (stats=%s)\n",
+                __func__, stats_path && stats_path[0] ? stats_path : "<none>");
     }
 }
 

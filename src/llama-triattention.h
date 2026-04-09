@@ -27,7 +27,7 @@ struct llama_hparams;
 //
 // Header:
 //   magic          uint32  0x54524941 ("TRIA")
-//   version        uint32  1
+//   version        uint32  1 or 2
 //   head_dim       uint32  e.g. 128
 //   num_layers     uint32  e.g. 36
 //   num_attn_heads uint32  e.g. 36  (total attention heads, not KV heads)
@@ -39,6 +39,10 @@ struct llama_hparams;
 //   name_len       uint32  length of model name string (including null)
 //   name           char[name_len]  UTF-8 null-terminated model name
 //
+// Version 2 adds:
+//   omega          float32[freq_count]
+//   freq_scale_sq  float32[freq_count]
+//
 // Per sampled head (repeated n_sampled times):
 //   layer_idx      uint32
 //   head_idx       uint32  (attention head index, 0..num_attn_heads-1)
@@ -48,7 +52,7 @@ struct llama_hparams;
 //   r_f            float32[freq_count]  ||E[q_f]|| / E[||q_f||] (validation)
 
 #define TRIATTENTION_MAGIC   0x54524941u  // "TRIA" in little-endian
-#define TRIATTENTION_VERSION 1u
+#define TRIATTENTION_VERSION 2u
 
 // ============================================================================
 // Enums
@@ -89,6 +93,13 @@ enum triattention_agg {
     TRIATTENTION_AGG_MAX  = 1,  // Alternative: max over offsets
 };
 
+// Runtime fallback policy used when calibration stats are unavailable.
+enum triattention_fallback {
+    TRIATTENTION_FALLBACK_OFF                 = 0,
+    TRIATTENTION_FALLBACK_AUTO                = 1,
+    TRIATTENTION_FALLBACK_HYBRID_NORM_RECENCY = 2,
+};
+
 // ============================================================================
 // Data structures
 // ============================================================================
@@ -100,6 +111,7 @@ struct triattention_head_stats {
     float * q_mean_real;    // [freq_count]  Re(E[q_f])
     float * q_mean_imag;    // [freq_count]  Im(E[q_f])
     float * q_abs_mean;     // [freq_count]  E[||q_f||]
+    float * r_f;            // [freq_count]  ||E[q_f]|| / E[||q_f||]
 
     // Precomputed at init time from the above:
     float * q_mean_abs;     // [freq_count]  ||E[q_f]|| = sqrt(re^2 + im^2)
@@ -108,6 +120,7 @@ struct triattention_head_stats {
 
 // Model calibration data loaded from .triattention file
 struct triattention_calibration {
+    uint32_t version;
     uint32_t head_dim;
     uint32_t num_layers;
     uint32_t num_attn_heads;      // total attention heads
@@ -118,12 +131,33 @@ struct triattention_calibration {
     uint32_t freq_count;          // = head_dim / 2
     uint32_t n_sampled;           // number of (layer, head) pairs
 
+    float * omega;                // [freq_count]  explicit RoPE angular frequencies (v2)
+    float * freq_scale_sq;        // [freq_count]  explicit RoPE magnitude scaling^2 (v2)
+
     // Per sampled head arrays — length n_sampled
     uint32_t * sampled_layer;     // [n_sampled]  layer index
     uint32_t * sampled_head;      // [n_sampled]  attention head index
     triattention_head_stats * head_stats;  // [n_sampled]
 
     char model_name[256];
+};
+
+// Model/runtime parameters needed to build fallback state and validate calibration.
+struct triattention_model_params {
+    uint32_t kv_size;
+    uint32_t head_dim;
+    uint32_t num_layers;
+    uint32_t num_attn_heads;
+    uint32_t num_kv_heads;
+    uint32_t rope_style;          // 0 = half, 1 = interleaved
+    uint32_t n_ctx_orig;
+
+    double rope_theta;
+    float  rope_freq_scale;
+    float  rope_ext_factor;
+    float  rope_attn_factor;
+    float  rope_beta_fast;
+    float  rope_beta_slow;
 };
 
 // Runtime configuration — set from CLI args, immutable after init
@@ -143,12 +177,17 @@ struct triattention_config {
     bool enable_logging;          // Log pruning events to stderr (default: false)
 
     int32_t seed;                 // RNG seed for tie-breaking noise (-1 = disabled, default: 0)
+
+    enum triattention_fallback fallback_mode; // default: AUTO
+    float fallback_recency_weight;            // lambda in [0, 1], default: 0.25
 };
 
 // Runtime state — one per KV cache instance
 struct triattention_state {
     triattention_calibration * cal;
     triattention_config cfg;
+    triattention_model_params model;
+    bool fallback_active;
 
     // Inference tracking
     int64_t  absolute_position;   // Monotonically increasing token counter
@@ -209,10 +248,7 @@ extern "C" {
 triattention_state * triattention_init(
     const char * stats_path,
     const triattention_config * cfg,
-    uint32_t kv_size,
-    double   rope_theta,
-    uint32_t head_dim,
-    uint32_t n_kv_heads);
+    const triattention_model_params * model);
 
 // Free all memory associated with a TriAttention state.
 // Safe to call with nullptr.
@@ -292,6 +328,28 @@ void triattention_score_keys(
     uint32_t n_offsets,
     enum triattention_agg agg,
     bool disable_trig);
+
+// Fallback scorer used when no calibration file is available.
+// Computes a norm-based score from pre-RoPE K only.
+void triattention_score_keys_norm(
+    float       * out_scores,
+    const float * pre_rope_k,
+    const float * freq_scale_sq,
+    uint32_t n_keys,
+    uint32_t head_dim,
+    uint32_t freq_count);
+
+// Internal helpers for the experimental fallback path.
+void triattention_build_recency_scores(
+    float         * out_scores,
+    const int32_t * key_positions,
+    uint32_t        n_keys);
+
+void triattention_blend_fallback_scores(
+    float       * scores,
+    const float * recency_scores,
+    uint32_t      n_keys,
+    float         lambda);
 
 // ============================================================================
 // Main pruning entry point

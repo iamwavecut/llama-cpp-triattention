@@ -4,6 +4,7 @@
 #include "llama.h"
 
 #include "ggml-backend.h"
+#include "gguf.h"
 #include "llama-context.h"
 #include "llama-model.h"
 #include "llama-triattention-calibration.h"
@@ -12,7 +13,10 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string>
+#include <system_error>
 #include <vector>
 
 enum class tool_mode {
@@ -31,11 +35,218 @@ struct capture_context {
     bool failed = false;
 };
 
+static bool path_has_extension(const std::string & path, const char * ext) {
+    return std::filesystem::path(path).extension() == ext;
+}
+
+static std::string default_embedded_output_path(const std::string & model_path) {
+    std::filesystem::path out(model_path);
+    const std::string stem = out.stem().string();
+    out.replace_filename(stem + ".triattention.gguf");
+    return out.string();
+}
+
+static void write_zeros(std::ofstream & out, size_t nbytes) {
+    static const std::vector<char> zeros(1 << 20, 0);
+    size_t remaining = nbytes;
+    while (remaining > 0) {
+        const size_t chunk = std::min(remaining, zeros.size());
+        out.write(zeros.data(), (std::streamsize) chunk);
+        remaining -= chunk;
+    }
+}
+
+static bool copy_bytes(std::ifstream & in, std::ofstream & out, size_t nbytes, std::vector<char> & buffer) {
+    size_t remaining = nbytes;
+    while (remaining > 0) {
+        const size_t chunk = std::min(remaining, buffer.size());
+        in.read(buffer.data(), (std::streamsize) chunk);
+        if ((size_t) in.gcount() != chunk) {
+            return false;
+        }
+        out.write(buffer.data(), (std::streamsize) chunk);
+        remaining -= chunk;
+    }
+    return true;
+}
+
+static bool gguf_read_embedded_calibration(
+    const std::string & path,
+    std::vector<uint8_t> & blob,
+    std::string & error) {
+    blob.clear();
+
+    ggml_context * ctx_meta = nullptr;
+    gguf_init_params params = {
+        /*.no_alloc = */ true,
+        /*.ctx      = */ &ctx_meta,
+    };
+
+    gguf_context * ctx_gguf = gguf_init_from_file(path.c_str(), params);
+    if (!ctx_gguf) {
+        error = "failed to open GGUF metadata";
+        return false;
+    }
+
+    const int kid = gguf_find_key(ctx_gguf, TRIATTENTION_GGUF_KEY);
+    if (kid < 0) {
+        error = "embedded TriAttention calibration not found";
+        gguf_free(ctx_gguf);
+        ggml_free(ctx_meta);
+        return false;
+    }
+
+    if (gguf_get_kv_type(ctx_gguf, kid) != GGUF_TYPE_ARRAY || gguf_get_arr_type(ctx_gguf, kid) != GGUF_TYPE_UINT8) {
+        error = "embedded TriAttention calibration has unexpected GGUF type";
+        gguf_free(ctx_gguf);
+        ggml_free(ctx_meta);
+        return false;
+    }
+
+    const size_t n = gguf_get_arr_n(ctx_gguf, kid);
+    const void * data = gguf_get_arr_data(ctx_gguf, kid);
+    blob.resize(n);
+    if (n > 0 && data == nullptr) {
+        error = "embedded TriAttention calibration data is missing";
+        gguf_free(ctx_gguf);
+        ggml_free(ctx_meta);
+        return false;
+    }
+    if (n > 0) {
+        memcpy(blob.data(), data, n);
+    }
+
+    gguf_free(ctx_gguf);
+    ggml_free(ctx_meta);
+    return true;
+}
+
+static triattention_calibration * load_calibration_artifact(
+    const std::string & path,
+    bool verbose,
+    std::string & source_desc) {
+    if (path_has_extension(path, ".gguf")) {
+        std::vector<uint8_t> blob;
+        std::string error;
+        if (!gguf_read_embedded_calibration(path, blob, error)) {
+            LOG_ERR("%s: %s\n", path.c_str(), error.c_str());
+            return nullptr;
+        }
+        source_desc = std::string("embedded:") + path;
+        return triattention_calibration_load_from_buffer(blob.data(), blob.size(), verbose, path.c_str());
+    }
+
+    source_desc = path;
+    return triattention_calibration_load(path.c_str(), verbose);
+}
+
+static bool write_embedded_calibration_gguf(
+    const std::string & input_model,
+    const std::string & output_model,
+    const std::vector<uint8_t> & calibration_blob) {
+    if (input_model.empty() || output_model.empty() || calibration_blob.empty()) {
+        return false;
+    }
+    if (input_model == output_model) {
+        LOG_ERR("refusing to overwrite the input model in place: %s\n", input_model.c_str());
+        return false;
+    }
+
+    ggml_context * ctx_meta = nullptr;
+    gguf_init_params params = {
+        /*.no_alloc = */ true,
+        /*.ctx      = */ &ctx_meta,
+    };
+
+    gguf_context * ctx_in = gguf_init_from_file(input_model.c_str(), params);
+    if (!ctx_in) {
+        LOG_ERR("failed to open input GGUF metadata: %s\n", input_model.c_str());
+        return false;
+    }
+
+    const int split_kid = gguf_find_key(ctx_in, "split.count");
+    if (split_kid >= 0 && gguf_get_val_u16(ctx_in, split_kid) > 1) {
+        LOG_ERR("embedding calibration into split GGUFs is not supported yet: %s\n", input_model.c_str());
+        gguf_free(ctx_in);
+        ggml_free(ctx_meta);
+        return false;
+    }
+
+    gguf_context * ctx_out = gguf_init_empty();
+    gguf_set_kv(ctx_out, ctx_in);
+    gguf_set_arr_data(ctx_out, TRIATTENTION_GGUF_KEY, GGUF_TYPE_UINT8, calibration_blob.data(), calibration_blob.size());
+
+    const int n_tensors = gguf_get_n_tensors(ctx_in);
+    for (int i = 0; i < n_tensors; ++i) {
+        const char * name = gguf_get_tensor_name(ctx_in, i);
+        ggml_tensor * tensor = ggml_get_tensor(ctx_meta, name);
+        gguf_add_tensor(ctx_out, tensor);
+    }
+
+    std::ifstream fin(input_model, std::ios::binary);
+    if (!fin.is_open()) {
+        LOG_ERR("failed to open input GGUF for data copy: %s\n", input_model.c_str());
+        gguf_free(ctx_out);
+        gguf_free(ctx_in);
+        ggml_free(ctx_meta);
+        return false;
+    }
+
+    std::ofstream fout(output_model, std::ios::binary);
+    if (!fout.is_open()) {
+        LOG_ERR("failed to open output GGUF for writing: %s\n", output_model.c_str());
+        gguf_free(ctx_out);
+        gguf_free(ctx_in);
+        ggml_free(ctx_meta);
+        return false;
+    }
+
+    const size_t meta_size = gguf_get_meta_size(ctx_out);
+    write_zeros(fout, meta_size);
+
+    std::vector<char> buffer(16 * 1024 * 1024);
+    for (int i = 0; i < n_tensors; ++i) {
+        const char * name = gguf_get_tensor_name(ctx_in, i);
+        ggml_tensor * tensor = ggml_get_tensor(ctx_meta, name);
+        const size_t nbytes = ggml_nbytes(tensor);
+        const size_t offset = gguf_get_data_offset(ctx_in) + gguf_get_tensor_offset(ctx_in, i);
+
+        fin.seekg((std::streamoff) offset);
+        if (!fin.good() || !copy_bytes(fin, fout, nbytes, buffer)) {
+            LOG_ERR("failed to copy tensor data for %s\n", name);
+            gguf_free(ctx_out);
+            gguf_free(ctx_in);
+            ggml_free(ctx_meta);
+            return false;
+        }
+
+        const size_t padded = GGML_PAD(nbytes, GGUF_DEFAULT_ALIGNMENT);
+        if (padded > nbytes) {
+            write_zeros(fout, padded - nbytes);
+        }
+    }
+
+    fout.seekp(0);
+    std::vector<uint8_t> meta(meta_size);
+    gguf_get_meta_data(ctx_out, meta.data());
+    fout.write((const char *) meta.data(), (std::streamsize) meta.size());
+    fout.close();
+
+    gguf_free(ctx_out);
+    gguf_free(ctx_in);
+    ggml_free(ctx_meta);
+    return true;
+}
+
 static void print_usage(int, char ** argv) {
     LOG("\nexample usage:\n");
-    LOG("\n    %s -m model.gguf -f corpus.txt -o model.triattention [-c 8192] [-b 2048]\n", argv[0]);
+    LOG("\n    %s -m model.gguf -f corpus.txt -o model.calibrated.gguf [-c 8192] [-b 2048]\n", argv[0]);
+    LOG("    %s -m model.gguf -f corpus.txt -o model.calibrated.gguf --external-out model.triattention\n", argv[0]);
+    LOG("    %s -m model.gguf -f corpus.txt --external-out model.triattention --no-embed\n", argv[0]);
     LOG("    %s --inspect model.triattention\n", argv[0]);
+    LOG("    %s --inspect model.calibrated.gguf\n", argv[0]);
     LOG("    %s --validate model.triattention -m model.gguf\n", argv[0]);
+    LOG("    %s --validate model.calibrated.gguf\n", argv[0]);
     LOG("\n");
 }
 
@@ -131,7 +342,8 @@ static std::string infer_model_name(const llama_model * model, const common_para
 }
 
 static int run_inspect(const std::string & path) {
-    triattention_calibration * cal = triattention_calibration_load(path.c_str(), false);
+    std::string source_desc;
+    triattention_calibration * cal = load_calibration_artifact(path, false, source_desc);
     if (!cal) {
         return 1;
     }
@@ -142,13 +354,18 @@ static int run_inspect(const std::string & path) {
         if (!cal->head_stats[i].r_f) {
             continue;
         }
-        for (uint32_t f = 0; f < cal->freq_count; ++f) {
+        const uint32_t layer_idx = cal->sampled_layer ? cal->sampled_layer[i] : 0;
+        const uint32_t freq_count = layer_idx < cal->num_layers
+            ? cal->layers[layer_idx].freq_count
+            : cal->freq_count;
+        for (uint32_t f = 0; f < freq_count; ++f) {
             mean_rf += cal->head_stats[i].r_f[f];
             ++rf_count;
         }
     }
 
     LOG("file:               %s\n", path.c_str());
+    LOG("source:             %s\n", source_desc.c_str());
     LOG("version:            %u\n", cal->version);
     LOG("model:              %s\n", cal->model_name);
     LOG("layers:             %u\n", cal->num_layers);
@@ -246,6 +463,9 @@ int main(int argc, char ** argv) {
     common_params params;
     tool_mode mode = tool_mode::build;
     std::string target_file;
+    std::string external_out;
+    bool no_embed = false;
+    bool has_model_arg = false;
     std::vector<char *> filtered_argv;
     filtered_argv.reserve((size_t) argc);
     filtered_argv.push_back(argv[0]);
@@ -265,11 +485,35 @@ int main(int argc, char ** argv) {
             target_file = argv[++i];
             continue;
         }
+        if (arg == "--external-out") {
+            if (i + 1 >= argc) {
+                LOG_ERR("missing file path after %s\n", arg.c_str());
+                return 1;
+            }
+            external_out = argv[++i];
+            continue;
+        }
+        if (arg == "--no-embed") {
+            no_embed = true;
+            continue;
+        }
+        if (arg == "-m" || arg == "--model") {
+            has_model_arg = true;
+        }
         filtered_argv.push_back(argv[i]);
     }
 
     if (mode == tool_mode::inspect) {
         return run_inspect(target_file);
+    }
+
+    std::string inferred_validate_model;
+    std::string inferred_validate_model_flag;
+    if (mode == tool_mode::validate && !has_model_arg && path_has_extension(target_file, ".gguf")) {
+        inferred_validate_model = target_file;
+        inferred_validate_model_flag = "-m";
+        filtered_argv.push_back(inferred_validate_model_flag.data());
+        filtered_argv.push_back(inferred_validate_model.data());
     }
 
     if (!common_params_parse((int) filtered_argv.size(), filtered_argv.data(), params, LLAMA_EXAMPLE_IMATRIX, print_usage)) {
@@ -285,8 +529,11 @@ int main(int argc, char ** argv) {
     params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
 
     if (mode == tool_mode::validate) {
+        if (params.model.path.empty() && path_has_extension(target_file, ".gguf")) {
+            params.model.path = target_file;
+        }
         if (params.model.path.empty()) {
-            LOG_ERR("validation requires -m <model.gguf>\n");
+            LOG_ERR("validation requires -m <model.gguf> unless the target file is an embedded-calibration GGUF\n");
             llama_backend_free();
             return 1;
         }
@@ -306,8 +553,10 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
-        triattention_calibration * cal = triattention_calibration_load(target_file.c_str(), false);
+        std::string source_desc;
+        triattention_calibration * cal = load_calibration_artifact(target_file, false, source_desc);
         if (!cal) {
+            triattention_model_params_clear(&model_params);
             llama_backend_free();
             return 1;
         }
@@ -330,8 +579,16 @@ int main(int argc, char ** argv) {
         llama_backend_free();
         return 1;
     }
-    if (params.out_file.empty()) {
-        LOG_ERR("calibration build requires -o <output.triattention>\n");
+    const bool legacy_external_out = !params.out_file.empty() && path_has_extension(params.out_file, ".triattention") && external_out.empty();
+    if (legacy_external_out) {
+        external_out = params.out_file;
+        no_embed = true;
+        params.out_file.clear();
+        LOG_WRN("treating legacy -o <output.triattention> as --external-out + --no-embed\n");
+    }
+
+    if (no_embed && external_out.empty()) {
+        LOG_ERR("--no-embed requires --external-out <output.triattention>\n");
         llama_backend_free();
         return 1;
     }
@@ -391,14 +648,39 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (!triattention_calibration_save(params.out_file.c_str(), cal)) {
+    std::vector<uint8_t> calibration_blob;
+    if (!triattention_calibration_save_to_buffer(cal, calibration_blob)) {
+        LOG_ERR("failed to serialize calibration output\n");
         triattention_calibration_free(cal);
         triattention_model_params_clear(&model_params);
         llama_backend_free();
         return 1;
     }
 
-    LOG("wrote calibration: %s\n", params.out_file.c_str());
+    if (!external_out.empty() && !triattention_calibration_save(external_out.c_str(), cal)) {
+        triattention_calibration_free(cal);
+        triattention_model_params_clear(&model_params);
+        llama_backend_free();
+        return 1;
+    }
+
+    if (!no_embed) {
+        const std::string output_model = params.out_file.empty()
+            ? default_embedded_output_path(params.model.path)
+            : params.out_file;
+        if (!write_embedded_calibration_gguf(params.model.path, output_model, calibration_blob)) {
+            triattention_calibration_free(cal);
+            triattention_model_params_clear(&model_params);
+            llama_backend_free();
+            return 1;
+        }
+        LOG("wrote calibrated gguf: %s\n", output_model.c_str());
+    }
+
+    if (!external_out.empty()) {
+        LOG("wrote external calibration: %s\n", external_out.c_str());
+    }
+
     triattention_calibration_free(cal);
     triattention_model_params_clear(&model_params);
     llama_backend_free();

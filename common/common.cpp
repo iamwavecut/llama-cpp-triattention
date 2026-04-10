@@ -1255,7 +1255,7 @@ common_init_result::common_init_result(common_params & params) :
             params.triattention_fallback,
             params.triattention_fallback_recency_weight);
         if (rc != 0) {
-            LOG_ERR("%s: TriAttention initialization failed (stats=%s, fallback=%d)\n",
+            LOG_ERR("%s: TriAttention initialization failed (embedded/explicit/sidecar resolution, explicit-stats=%s, fallback=%d)\n",
                     __func__,
                     params.triattention_stats.empty() ? "<none>" : params.triattention_stats.c_str(),
                     params.triattention_fallback);

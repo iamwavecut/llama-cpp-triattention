@@ -18,7 +18,7 @@ This repository now supports two runtime modes:
 
 | Question | Answer |
 |----------|--------|
-| Can TriAttention run without a `.triattention` file? | Yes, if `--triattention-fallback auto` or `--triattention-fallback hybrid-norm-recency` is enabled |
+| Can TriAttention run without an external `.triattention` file? | Yes. The runtime checks embedded `GGUF` calibration first, then an explicit file, then a sidecar, then fallback |
 | Is that equivalent to the paper? | No |
 | What should be used for quality-sensitive runs? | A calibration file built from a representative corpus and the same target model |
 
@@ -36,7 +36,7 @@ cmake --build build --target llama-cli llama-server llama-triattention-calibrate
 
 ## Calibration workflow
 
-### 1. Build a `.triattention` file
+### 1. Build a calibrated `GGUF` copy
 
 The calibration tool consumes a local `GGUF` model and a plain-text corpus:
 
@@ -44,7 +44,19 @@ The calibration tool consumes a local `GGUF` model and a plain-text corpus:
 ./build/bin/llama-triattention-calibrate \
     -m models/model.gguf \
     -f corpus.txt \
-    -o models/model.triattention \
+    -o models/model.triattention.gguf \
+    -c 8192 \
+    -b 2048
+```
+
+Optional external-artifact mode:
+
+```bash
+./build/bin/llama-triattention-calibrate \
+    -m models/model.gguf \
+    -f corpus.txt \
+    --external-out models/model.triattention \
+    --no-embed \
     -c 8192 \
     -b 2048
 ```
@@ -59,9 +71,10 @@ Notes:
 | KV handling | KV cache is cleared between chunks |
 | Capture point | Query tensors are captured via `ggml_backend_sched_eval_callback()` on `GGML_OP_ROPE` inputs |
 
-### 2. Inspect the file
+### 2. Inspect the output
 
 ```bash
+./build/bin/llama-triattention-calibrate --inspect models/model.triattention.gguf
 ./build/bin/llama-triattention-calibrate --inspect models/model.triattention
 ```
 
@@ -72,15 +85,32 @@ and whether explicit `omega` / `freq_scale_sq` arrays are embedded.
 
 ```bash
 ./build/bin/llama-triattention-calibrate \
+    --validate models/model.triattention.gguf
+```
+
+Validation checks the model geometry and warns on RoPE parameter mismatches.
+For an external artifact:
+
+```bash
+./build/bin/llama-triattention-calibrate \
     --validate models/model.triattention \
     -m models/model.gguf
 ```
 
-Validation checks the model geometry and warns on RoPE parameter mismatches.
-
 ## Inference workflow
 
 ### Calibrated mode
+
+```bash
+./build/bin/llama-server \
+    -m models/model.triattention.gguf \
+    --triattention-budget 2048 \
+    --triattention-window 128 \
+    --triattention-trigger interval \
+    -c 131072
+```
+
+Explicit external-artifact mode:
 
 ```bash
 ./build/bin/llama-server \
@@ -111,7 +141,7 @@ offline calibration pass, but it should be treated as a separate heuristic.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--triattention-stats PATH` | none | Path to the calibration file; preferred runtime path |
+| `--triattention-stats PATH` | none | Explicit external calibration artifact. Checked only after embedded `GGUF` calibration |
 | `--triattention-budget N` | `512` | Maximum KV entries retained after pruning |
 | `--triattention-window N` | `64` | Pruning interval in decode tokens; the same recent window is protected from eviction |
 | `--triattention-offset-max N` | `65536` | Maximum geometric offset used by trig scoring |
@@ -131,7 +161,10 @@ offline calibration pass, but it should be treated as a separate heuristic.
 
 | Situation | Result |
 |-----------|--------|
-| `--triattention-stats` points to a valid file | Calibrated TriAttention is used |
+| Loaded `GGUF` contains embedded calibration | Embedded calibrated TriAttention is used |
+| No embedded calibration, `--triattention-stats` points to a valid file | External calibrated TriAttention is used |
+| No embedded calibration and no explicit file, but `<model>.triattention` exists and is valid | Sidecar calibrated TriAttention is used |
+| Sidecar file exists but is invalid or incompatible | It is ignored with a warning |
 | Stats file is missing or not provided and fallback is `auto` | Runtime constructs a fallback state and continues |
 | Stats file is provided but invalid or incompatible | Hard error |
 | No stats file and fallback is `off` | Hard error |
@@ -149,13 +182,14 @@ The binary format uses magic `0x54524941` (`TRIA`).
 | Version | Status | Notes |
 |---------|--------|-------|
 | `1` | Read-only compatibility | Legacy files without explicit `omega` / `freq_scale_sq` arrays |
-| `2` | Current write format | Default output of `llama-triattention-calibrate` |
+| `2` | Read/write compatibility | Uniform-layout explicit-rope format |
+| `3` | Current write format | Per-layer geometry and RoPE metadata; default serialized artifact format |
 
 ### Header
 
 ```text
 magic          u32    0x54524941
-version        u32    1 or 2
+version        u32    1, 2, or 3
 head_dim       u32
 num_layers     u32
 num_attn_heads u32
@@ -168,7 +202,7 @@ name_len       u32
 name           char[name_len]
 ```
 
-Version 2 then appends:
+Version 2 appends:
 
 ```text
 omega          f32[freq_count]
@@ -185,6 +219,10 @@ q_mean_imag    f32[freq_count]
 q_abs_mean     f32[freq_count]
 r_f            f32[freq_count]
 ```
+
+Version 3 additionally stores per-layer head geometry, RoPE layout, KV-source
+mapping, and optional explicit `omega` / `freq_scale_sq` arrays per layer so
+heterogeneous models such as Gemma 4 / iSWA can be calibrated faithfully.
 
 For version 1 files, runtime reconstructs `omega` from the model's RoPE
 parameters and uses `freq_scale_sq = 1` when explicit arrays are absent.
@@ -208,4 +246,3 @@ parameters and uses `freq_scale_sq = 1` when explicit arrays are absent.
 | Corpus mode | Plain text only in the first implementation |
 | Model family | Decoder-only RoPE models whose query path appears as `GGML_OP_ROPE` over 3D query tensors |
 | Fallback semantics | Heuristic only; not a paper claim |
-

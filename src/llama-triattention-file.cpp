@@ -9,11 +9,42 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <vector>
 
 static constexpr uint32_t TRIATTENTION_VERSION_V1 = 1u;
 static constexpr uint32_t TRIATTENTION_VERSION_V2 = 2u;
 static constexpr uint32_t TRIATTENTION_LAYER_NONE = std::numeric_limits<uint32_t>::max();
+
+struct triattention_binary_reader {
+    const uint8_t * data = nullptr;
+    size_t size = 0;
+    size_t offset = 0;
+    const char * source = "<memory>";
+
+    bool read(void * dst, size_t nbytes) {
+        if (!dst || offset > size || nbytes > size - offset) {
+            return false;
+        }
+        memcpy(dst, data + offset, nbytes);
+        offset += nbytes;
+        return true;
+    }
+};
+
+struct triattention_binary_writer {
+    std::vector<uint8_t> * out = nullptr;
+
+    bool write(const void * src, size_t nbytes) {
+        if (!out) {
+            return false;
+        }
+        const size_t base = out->size();
+        out->resize(base + nbytes);
+        memcpy(out->data() + base, src, nbytes);
+        return true;
+    }
+};
 
 static float triattention_rope_yarn_ramp(float low, float high, int i0) {
     const float y = (i0 / 2.0f - low) / fmaxf(0.001f, high - low);
@@ -443,6 +474,132 @@ void triattention_calibration_free(triattention_calibration * cal) {
     delete cal;
 }
 
+static bool triattention_read_legacy_header(
+    triattention_binary_reader & reader,
+    triattention_calibration * cal) {
+    bool ok = true;
+    ok = ok && reader.read(&cal->head_dim,       sizeof(uint32_t));
+    ok = ok && reader.read(&cal->num_layers,     sizeof(uint32_t));
+    ok = ok && reader.read(&cal->num_attn_heads, sizeof(uint32_t));
+    ok = ok && reader.read(&cal->num_kv_heads,   sizeof(uint32_t));
+    ok = ok && reader.read(&cal->rope_theta,     sizeof(double));
+    ok = ok && reader.read(&cal->rope_style,     sizeof(uint32_t));
+    ok = ok && reader.read(&cal->n_sampled,      sizeof(uint32_t));
+    ok = ok && reader.read(&cal->freq_count,     sizeof(uint32_t));
+    return ok;
+}
+
+static bool triattention_read_model_name(
+    triattention_binary_reader & reader,
+    triattention_calibration * cal) {
+    uint32_t name_len = 0;
+    if (!reader.read(&name_len, sizeof(name_len)) || name_len == 0 || name_len > sizeof(cal->model_name)) {
+        fprintf(stderr, "[TriAttention] ERROR: invalid model name length %u in %s\n", name_len, reader.source);
+        return false;
+    }
+
+    if (!reader.read(cal->model_name, name_len)) {
+        fprintf(stderr, "[TriAttention] ERROR: truncated model name in %s\n", reader.source);
+        return false;
+    }
+
+    cal->model_name[sizeof(cal->model_name) - 1] = '\0';
+    return true;
+}
+
+static bool triattention_read_v3_layers(
+    triattention_binary_reader & reader,
+    triattention_calibration * cal) {
+    uint32_t layer_count = 0;
+    if (!reader.read(&layer_count, sizeof(layer_count)) || layer_count != cal->num_layers) {
+        fprintf(stderr, "[TriAttention] ERROR: invalid v3 layer count in %s\n", reader.source);
+        return false;
+    }
+
+    cal->layers = new triattention_layer_params[cal->num_layers];
+    memset(cal->layers, 0, sizeof(triattention_layer_params) * cal->num_layers);
+
+    for (uint32_t il = 0; il < cal->num_layers; ++il) {
+        triattention_layer_params & layer = cal->layers[il];
+        uint32_t has_explicit_rope = 0;
+
+        bool ok = true;
+        ok = ok && reader.read(&layer.head_dim,         sizeof(uint32_t));
+        ok = ok && reader.read(&layer.rope_dim,         sizeof(uint32_t));
+        ok = ok && reader.read(&layer.rope_offset,      sizeof(uint32_t));
+        ok = ok && reader.read(&layer.num_attn_heads,   sizeof(uint32_t));
+        ok = ok && reader.read(&layer.num_kv_heads,     sizeof(uint32_t));
+        ok = ok && reader.read(&layer.kv_source_layer,  sizeof(uint32_t));
+        ok = ok && reader.read(&layer.rope_style,       sizeof(uint32_t));
+        ok = ok && reader.read(&layer.n_ctx_orig,       sizeof(uint32_t));
+        ok = ok && reader.read(&layer.rope_theta,       sizeof(double));
+        ok = ok && reader.read(&layer.rope_freq_scale,  sizeof(float));
+        ok = ok && reader.read(&layer.rope_ext_factor,  sizeof(float));
+        ok = ok && reader.read(&layer.rope_attn_factor, sizeof(float));
+        ok = ok && reader.read(&layer.rope_beta_fast,   sizeof(float));
+        ok = ok && reader.read(&layer.rope_beta_slow,   sizeof(float));
+        ok = ok && reader.read(&layer.freq_count,       sizeof(uint32_t));
+        ok = ok && reader.read(&has_explicit_rope,      sizeof(uint32_t));
+        if (!ok) {
+            fprintf(stderr, "[TriAttention] ERROR: truncated v3 layer %u in %s\n", il, reader.source);
+            return false;
+        }
+
+        layer.num_kv_groups = layer.num_kv_heads > 0 ? layer.num_attn_heads / layer.num_kv_heads : 0;
+
+        if (layer.rope_dim != layer.freq_count * 2 || layer.head_dim < layer.rope_dim ||
+            layer.rope_offset > layer.head_dim - layer.rope_dim) {
+            fprintf(stderr, "[TriAttention] ERROR: invalid v3 layer geometry in %s\n", reader.source);
+            return false;
+        }
+
+        if (has_explicit_rope) {
+            layer.omega = new float[layer.freq_count];
+            layer.freq_scale_sq = new float[layer.freq_count];
+            ok = true;
+            ok = ok && reader.read(layer.omega,         sizeof(float) * layer.freq_count);
+            ok = ok && reader.read(layer.freq_scale_sq, sizeof(float) * layer.freq_count);
+            if (!ok) {
+                fprintf(stderr, "[TriAttention] ERROR: truncated v3 rope arrays in %s\n", reader.source);
+                return false;
+            }
+        }
+    }
+
+    triattention_update_summary_from_layers(cal, cal->layers, cal->num_layers);
+    if (!cal->heterogeneous_layout && cal->num_layers > 0 && cal->layers[0].omega && cal->layers[0].freq_scale_sq) {
+        cal->omega = new float[cal->layers[0].freq_count];
+        cal->freq_scale_sq = new float[cal->layers[0].freq_count];
+        memcpy(cal->omega, cal->layers[0].omega, sizeof(float) * cal->layers[0].freq_count);
+        memcpy(cal->freq_scale_sq, cal->layers[0].freq_scale_sq, sizeof(float) * cal->layers[0].freq_count);
+    }
+
+    return true;
+}
+
+static bool triattention_write_legacy_header(
+    triattention_binary_writer & writer,
+    const triattention_calibration * cal,
+    uint32_t version,
+    uint32_t name_len) {
+    const uint32_t magic = TRIATTENTION_MAGIC;
+
+    bool ok = true;
+    ok = ok && writer.write(&magic,               sizeof(magic));
+    ok = ok && writer.write(&version,             sizeof(version));
+    ok = ok && writer.write(&cal->head_dim,       sizeof(uint32_t));
+    ok = ok && writer.write(&cal->num_layers,     sizeof(uint32_t));
+    ok = ok && writer.write(&cal->num_attn_heads, sizeof(uint32_t));
+    ok = ok && writer.write(&cal->num_kv_heads,   sizeof(uint32_t));
+    ok = ok && writer.write(&cal->rope_theta,     sizeof(double));
+    ok = ok && writer.write(&cal->rope_style,     sizeof(uint32_t));
+    ok = ok && writer.write(&cal->n_sampled,      sizeof(uint32_t));
+    ok = ok && writer.write(&cal->freq_count,     sizeof(uint32_t));
+    ok = ok && writer.write(&name_len,            sizeof(name_len));
+    ok = ok && writer.write(cal->model_name,      name_len);
+    return ok;
+}
+
 static bool triattention_read_legacy_header(FILE * f, triattention_calibration * cal) {
     bool ok = true;
     ok = ok && fread(&cal->head_dim,       sizeof(uint32_t), 1, f) == 1;
@@ -578,26 +735,33 @@ static bool triattention_read_v3_layers(FILE * f, triattention_calibration * cal
     return true;
 }
 
-triattention_calibration * triattention_calibration_load(const char * path, bool verbose) {
-    FILE * f = fopen(path, "rb");
-    if (!f) {
-        fprintf(stderr, "[TriAttention] ERROR: cannot open calibration file: %s\n", path);
+triattention_calibration * triattention_calibration_load_from_buffer(
+    const void * data,
+    size_t size,
+    bool verbose,
+    const char * source_name) {
+    if (!data || size < sizeof(uint32_t) * 2) {
+        fprintf(stderr, "[TriAttention] ERROR: calibration buffer is empty or truncated (%s)\n",
+                source_name ? source_name : "<memory>");
         return nullptr;
     }
 
+    triattention_binary_reader reader = {};
+    reader.data = static_cast<const uint8_t *>(data);
+    reader.size = size;
+    reader.source = source_name ? source_name : "<memory>";
+
     uint32_t magic = 0;
-    if (fread(&magic, sizeof(magic), 1, f) != 1 || magic != TRIATTENTION_MAGIC) {
+    if (!reader.read(&magic, sizeof(magic)) || magic != TRIATTENTION_MAGIC) {
         fprintf(stderr, "[TriAttention] ERROR: invalid magic in %s (got 0x%08x, expected 0x%08x)\n",
-                path, magic, TRIATTENTION_MAGIC);
-        fclose(f);
+                reader.source, magic, TRIATTENTION_MAGIC);
         return nullptr;
     }
 
     uint32_t version = 0;
-    if (fread(&version, sizeof(version), 1, f) != 1 ||
+    if (!reader.read(&version, sizeof(version)) ||
         (version != TRIATTENTION_VERSION_V1 && version != TRIATTENTION_VERSION_V2 && version != TRIATTENTION_VERSION)) {
-        fprintf(stderr, "[TriAttention] ERROR: unsupported version %u in %s\n", version, path);
-        fclose(f);
+        fprintf(stderr, "[TriAttention] ERROR: unsupported version %u in %s\n", version, reader.source);
         return nullptr;
     }
 
@@ -605,16 +769,14 @@ triattention_calibration * triattention_calibration_load(const char * path, bool
     memset(cal, 0, sizeof(*cal));
     cal->version = version;
 
-    if (!triattention_read_legacy_header(f, cal)) {
-        fprintf(stderr, "[TriAttention] ERROR: truncated header in %s\n", path);
+    if (!triattention_read_legacy_header(reader, cal)) {
+        fprintf(stderr, "[TriAttention] ERROR: truncated header in %s\n", reader.source);
         triattention_calibration_free(cal);
-        fclose(f);
         return nullptr;
     }
 
-    if (!triattention_read_model_name(f, cal, path)) {
+    if (!triattention_read_model_name(reader, cal)) {
         triattention_calibration_free(cal);
-        fclose(f);
         return nullptr;
     }
 
@@ -623,33 +785,29 @@ triattention_calibration * triattention_calibration_load(const char * path, bool
         cal->freq_scale_sq = new float[cal->freq_count];
 
         bool ok = true;
-        ok = ok && fread(cal->omega,         sizeof(float), cal->freq_count, f) == cal->freq_count;
-        ok = ok && fread(cal->freq_scale_sq, sizeof(float), cal->freq_count, f) == cal->freq_count;
+        ok = ok && reader.read(cal->omega,         sizeof(float) * cal->freq_count);
+        ok = ok && reader.read(cal->freq_scale_sq, sizeof(float) * cal->freq_count);
         if (!ok) {
-            fprintf(stderr, "[TriAttention] ERROR: truncated v2 rope arrays in %s\n", path);
+            fprintf(stderr, "[TriAttention] ERROR: truncated v2 rope arrays in %s\n", reader.source);
             triattention_calibration_free(cal);
-            fclose(f);
             return nullptr;
         }
     }
 
     if (version == TRIATTENTION_VERSION) {
-        if (!triattention_read_v3_layers(f, cal, path)) {
+        if (!triattention_read_v3_layers(reader, cal)) {
             triattention_calibration_free(cal);
-            fclose(f);
             return nullptr;
         }
     } else if (!triattention_build_uniform_layers(cal)) {
-        fprintf(stderr, "[TriAttention] ERROR: invalid legacy calibration geometry in %s\n", path);
+        fprintf(stderr, "[TriAttention] ERROR: invalid legacy calibration geometry in %s\n", reader.source);
         triattention_calibration_free(cal);
-        fclose(f);
         return nullptr;
     }
 
     if (cal->num_attn_heads == 0 || cal->num_layers == 0) {
-        fprintf(stderr, "[TriAttention] ERROR: invalid model dimensions in %s\n", path);
+        fprintf(stderr, "[TriAttention] ERROR: invalid model dimensions in %s\n", reader.source);
         triattention_calibration_free(cal);
-        fclose(f);
         return nullptr;
     }
 
@@ -661,12 +819,11 @@ triattention_calibration * triattention_calibration_load(const char * path, bool
     for (uint32_t h = 0; h < cal->n_sampled; ++h) {
         auto & hs = cal->head_stats[h];
         bool ok = true;
-        ok = ok && fread(&cal->sampled_layer[h], sizeof(uint32_t), 1, f) == 1;
-        ok = ok && fread(&cal->sampled_head[h],  sizeof(uint32_t), 1, f) == 1;
+        ok = ok && reader.read(&cal->sampled_layer[h], sizeof(uint32_t));
+        ok = ok && reader.read(&cal->sampled_head[h],  sizeof(uint32_t));
         if (!ok || cal->sampled_layer[h] >= cal->num_layers) {
-            fprintf(stderr, "[TriAttention] ERROR: truncated or invalid head entry %u in %s\n", h, path);
+            fprintf(stderr, "[TriAttention] ERROR: truncated or invalid head entry %u in %s\n", h, reader.source);
             triattention_calibration_free(cal);
-            fclose(f);
             return nullptr;
         }
 
@@ -677,19 +834,16 @@ triattention_calibration * triattention_calibration_load(const char * path, bool
         hs.r_f         = new float[freq_count];
 
         ok = true;
-        ok = ok && fread(hs.q_mean_real, sizeof(float), freq_count, f) == freq_count;
-        ok = ok && fread(hs.q_mean_imag, sizeof(float), freq_count, f) == freq_count;
-        ok = ok && fread(hs.q_abs_mean,  sizeof(float), freq_count, f) == freq_count;
-        ok = ok && fread(hs.r_f,         sizeof(float), freq_count, f) == freq_count;
+        ok = ok && reader.read(hs.q_mean_real, sizeof(float) * freq_count);
+        ok = ok && reader.read(hs.q_mean_imag, sizeof(float) * freq_count);
+        ok = ok && reader.read(hs.q_abs_mean,  sizeof(float) * freq_count);
+        ok = ok && reader.read(hs.r_f,         sizeof(float) * freq_count);
         if (!ok) {
-            fprintf(stderr, "[TriAttention] ERROR: truncated stats for head %u in %s\n", h, path);
+            fprintf(stderr, "[TriAttention] ERROR: truncated stats for head %u in %s\n", h, reader.source);
             triattention_calibration_free(cal);
-            fclose(f);
             return nullptr;
         }
     }
-
-    fclose(f);
 
     if (verbose) {
         fprintf(stderr, "[TriAttention] Loaded calibration: model=%s, version=%u, layers=%u, sampled=%u%s\n",
@@ -698,6 +852,38 @@ triattention_calibration * triattention_calibration_load(const char * path, bool
     }
 
     return cal;
+}
+
+triattention_calibration * triattention_calibration_load(const char * path, bool verbose) {
+    FILE * f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "[TriAttention] ERROR: cannot open calibration file: %s\n", path);
+        return nullptr;
+    }
+
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fprintf(stderr, "[TriAttention] ERROR: failed to seek calibration file: %s\n", path);
+        fclose(f);
+        return nullptr;
+    }
+
+    const long size_long = ftell(f);
+    if (size_long < 0) {
+        fprintf(stderr, "[TriAttention] ERROR: failed to determine calibration size: %s\n", path);
+        fclose(f);
+        return nullptr;
+    }
+    rewind(f);
+
+    std::vector<uint8_t> buffer((size_t) size_long);
+    if (!buffer.empty() && fread(buffer.data(), 1, buffer.size(), f) != buffer.size()) {
+        fprintf(stderr, "[TriAttention] ERROR: failed to read calibration file: %s\n", path);
+        fclose(f);
+        return nullptr;
+    }
+
+    fclose(f);
+    return triattention_calibration_load_from_buffer(buffer.data(), buffer.size(), verbose, path);
 }
 
 static bool triattention_write_legacy_header(FILE * f, const triattention_calibration * cal, uint32_t version, uint32_t name_len) {
@@ -719,51 +905,50 @@ static bool triattention_write_legacy_header(FILE * f, const triattention_calibr
     return ok;
 }
 
-bool triattention_calibration_save(const char * path, const triattention_calibration * cal) {
-    if (!path || !cal) {
+bool triattention_calibration_save_to_buffer(
+    const triattention_calibration * cal,
+    std::vector<uint8_t> & out) {
+    if (!cal) {
         return false;
     }
 
-    FILE * f = fopen(path, "wb");
-    if (!f) {
-        fprintf(stderr, "[TriAttention] ERROR: cannot write calibration file: %s\n", path);
-        return false;
-    }
+    out.clear();
+    triattention_binary_writer writer = { &out };
 
     const uint32_t version = cal->version == 0 ? TRIATTENTION_VERSION : cal->version;
     const uint32_t name_len = (uint32_t) strnlen(cal->model_name, sizeof(cal->model_name) - 1) + 1;
 
-    bool ok = triattention_write_legacy_header(f, cal, version, name_len);
+    bool ok = triattention_write_legacy_header(writer, cal, version, name_len);
 
     if (version == TRIATTENTION_VERSION_V2) {
         ok = ok && cal->omega != nullptr && cal->freq_scale_sq != nullptr;
-        ok = ok && fwrite(cal->omega,         sizeof(float), cal->freq_count, f) == cal->freq_count;
-        ok = ok && fwrite(cal->freq_scale_sq, sizeof(float), cal->freq_count, f) == cal->freq_count;
+        ok = ok && writer.write(cal->omega,         sizeof(float) * cal->freq_count);
+        ok = ok && writer.write(cal->freq_scale_sq, sizeof(float) * cal->freq_count);
     } else if (version >= TRIATTENTION_VERSION) {
         const uint32_t layer_count = cal->num_layers;
-        ok = ok && fwrite(&layer_count, sizeof(layer_count), 1, f) == 1;
+        ok = ok && writer.write(&layer_count, sizeof(layer_count));
         for (uint32_t il = 0; ok && il < cal->num_layers; ++il) {
             const triattention_layer_params & layer = cal->layers[il];
             const uint32_t has_explicit_rope = layer.omega && layer.freq_scale_sq ? 1u : 0u;
-            ok = ok && fwrite(&layer.head_dim,         sizeof(uint32_t), 1, f) == 1;
-            ok = ok && fwrite(&layer.rope_dim,         sizeof(uint32_t), 1, f) == 1;
-            ok = ok && fwrite(&layer.rope_offset,      sizeof(uint32_t), 1, f) == 1;
-            ok = ok && fwrite(&layer.num_attn_heads,   sizeof(uint32_t), 1, f) == 1;
-            ok = ok && fwrite(&layer.num_kv_heads,     sizeof(uint32_t), 1, f) == 1;
-            ok = ok && fwrite(&layer.kv_source_layer,  sizeof(uint32_t), 1, f) == 1;
-            ok = ok && fwrite(&layer.rope_style,       sizeof(uint32_t), 1, f) == 1;
-            ok = ok && fwrite(&layer.n_ctx_orig,       sizeof(uint32_t), 1, f) == 1;
-            ok = ok && fwrite(&layer.rope_theta,       sizeof(double),   1, f) == 1;
-            ok = ok && fwrite(&layer.rope_freq_scale,  sizeof(float),    1, f) == 1;
-            ok = ok && fwrite(&layer.rope_ext_factor,  sizeof(float),    1, f) == 1;
-            ok = ok && fwrite(&layer.rope_attn_factor, sizeof(float),    1, f) == 1;
-            ok = ok && fwrite(&layer.rope_beta_fast,   sizeof(float),    1, f) == 1;
-            ok = ok && fwrite(&layer.rope_beta_slow,   sizeof(float),    1, f) == 1;
-            ok = ok && fwrite(&layer.freq_count,       sizeof(uint32_t), 1, f) == 1;
-            ok = ok && fwrite(&has_explicit_rope,      sizeof(uint32_t), 1, f) == 1;
+            ok = ok && writer.write(&layer.head_dim,         sizeof(uint32_t));
+            ok = ok && writer.write(&layer.rope_dim,         sizeof(uint32_t));
+            ok = ok && writer.write(&layer.rope_offset,      sizeof(uint32_t));
+            ok = ok && writer.write(&layer.num_attn_heads,   sizeof(uint32_t));
+            ok = ok && writer.write(&layer.num_kv_heads,     sizeof(uint32_t));
+            ok = ok && writer.write(&layer.kv_source_layer,  sizeof(uint32_t));
+            ok = ok && writer.write(&layer.rope_style,       sizeof(uint32_t));
+            ok = ok && writer.write(&layer.n_ctx_orig,       sizeof(uint32_t));
+            ok = ok && writer.write(&layer.rope_theta,       sizeof(double));
+            ok = ok && writer.write(&layer.rope_freq_scale,  sizeof(float));
+            ok = ok && writer.write(&layer.rope_ext_factor,  sizeof(float));
+            ok = ok && writer.write(&layer.rope_attn_factor, sizeof(float));
+            ok = ok && writer.write(&layer.rope_beta_fast,   sizeof(float));
+            ok = ok && writer.write(&layer.rope_beta_slow,   sizeof(float));
+            ok = ok && writer.write(&layer.freq_count,       sizeof(uint32_t));
+            ok = ok && writer.write(&has_explicit_rope,      sizeof(uint32_t));
             if (has_explicit_rope) {
-                ok = ok && fwrite(layer.omega,         sizeof(float), layer.freq_count, f) == layer.freq_count;
-                ok = ok && fwrite(layer.freq_scale_sq, sizeof(float), layer.freq_count, f) == layer.freq_count;
+                ok = ok && writer.write(layer.omega,         sizeof(float) * layer.freq_count);
+                ok = ok && writer.write(layer.freq_scale_sq, sizeof(float) * layer.freq_count);
             }
         }
     }
@@ -773,14 +958,35 @@ bool triattention_calibration_save(const char * path, const triattention_calibra
         const uint32_t freq_count = cal->layers[layer_idx].freq_count;
         const triattention_head_stats & hs = cal->head_stats[h];
         ok = ok && hs.q_mean_real != nullptr && hs.q_mean_imag != nullptr && hs.q_abs_mean != nullptr && hs.r_f != nullptr;
-        ok = ok && fwrite(&cal->sampled_layer[h], sizeof(uint32_t), 1, f) == 1;
-        ok = ok && fwrite(&cal->sampled_head[h],  sizeof(uint32_t), 1, f) == 1;
-        ok = ok && fwrite(hs.q_mean_real, sizeof(float), freq_count, f) == freq_count;
-        ok = ok && fwrite(hs.q_mean_imag, sizeof(float), freq_count, f) == freq_count;
-        ok = ok && fwrite(hs.q_abs_mean,  sizeof(float), freq_count, f) == freq_count;
-        ok = ok && fwrite(hs.r_f,         sizeof(float), freq_count, f) == freq_count;
+        ok = ok && writer.write(&cal->sampled_layer[h], sizeof(uint32_t));
+        ok = ok && writer.write(&cal->sampled_head[h],  sizeof(uint32_t));
+        ok = ok && writer.write(hs.q_mean_real, sizeof(float) * freq_count);
+        ok = ok && writer.write(hs.q_mean_imag, sizeof(float) * freq_count);
+        ok = ok && writer.write(hs.q_abs_mean,  sizeof(float) * freq_count);
+        ok = ok && writer.write(hs.r_f,         sizeof(float) * freq_count);
     }
 
+    return ok;
+}
+
+bool triattention_calibration_save(const char * path, const triattention_calibration * cal) {
+    if (!path || !cal) {
+        return false;
+    }
+
+    std::vector<uint8_t> buffer;
+    if (!triattention_calibration_save_to_buffer(cal, buffer)) {
+        fprintf(stderr, "[TriAttention] ERROR: failed while serializing calibration file: %s\n", path);
+        return false;
+    }
+
+    FILE * f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "[TriAttention] ERROR: cannot write calibration file: %s\n", path);
+        return false;
+    }
+
+    const bool ok = buffer.empty() || fwrite(buffer.data(), 1, buffer.size(), f) == buffer.size();
     fclose(f);
 
     if (!ok) {

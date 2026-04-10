@@ -529,46 +529,21 @@ static void triattention_extract_rope_slice(
 // Public API: Init / Free
 // ============================================================================
 
-triattention_state * triattention_init(
-    const char * stats_path,
+static triattention_state * triattention_init_internal(
+    const triattention_calibration * full_cal,
+    bool fallback_active,
+    const char * source_name,
     const triattention_config * cfg,
     const triattention_model_params * model,
     const uint32_t * sampled_layers,
-    uint32_t n_sampled_layers)
-{
-    if (!cfg || !model) {
-        return nullptr;
-    }
-
-    triattention_calibration * full_cal = nullptr;
+    uint32_t n_sampled_layers) {
     triattention_calibration * cal = nullptr;
-    bool fallback_active = false;
-
-    if (stats_path && stats_path[0] != '\0') {
-        full_cal = triattention_calibration_load(stats_path);
-        if (!full_cal) {
-            return nullptr;
-        }
-        if (!triattention_calibration_validate(full_cal, model, true)) {
-            triattention_calibration_free(full_cal);
-            return nullptr;
-        }
+    if (full_cal) {
         cal = triattention_calibration_subset(full_cal, sampled_layers, n_sampled_layers);
-        triattention_calibration_free(full_cal);
         if (!cal) {
             return nullptr;
         }
     } else {
-        if (cfg->fallback_mode == TRIATTENTION_FALLBACK_OFF) {
-            fprintf(stderr, "[TriAttention] ERROR: no calibration file was provided and fallback is disabled\n");
-            return nullptr;
-        }
-        if (cfg->fallback_mode != TRIATTENTION_FALLBACK_AUTO &&
-            cfg->fallback_mode != TRIATTENTION_FALLBACK_HYBRID_NORM_RECENCY) {
-            fprintf(stderr, "[TriAttention] ERROR: unsupported fallback mode %d\n", (int) cfg->fallback_mode);
-            return nullptr;
-        }
-
         cal = triattention_calibration_create_fallback(model, sampled_layers, n_sampled_layers);
         if (!cal) {
             fprintf(stderr, "[TriAttention] ERROR: failed to construct runtime fallback state\n");
@@ -576,6 +551,8 @@ triattention_state * triattention_init(
         }
         fallback_active = true;
     }
+
+    const char * resolved_source = source_name && source_name[0] ? source_name : (fallback_active ? "runtime-fallback" : "<unknown>");
 
     // Allocate state
     auto * state = new triattention_state();
@@ -624,11 +601,9 @@ triattention_state * triattention_init(
         state->max_padded_head_dim = std::max(state->max_padded_head_dim, triattention_padded_dim(cal_layer.head_dim));
     }
 
-    // Geometric offsets — max 17 elements for offset_max=65536
-    state->offsets = new float[32];  // generous allocation
+    state->offsets = new float[32];
     state->n_offsets = triattention_build_offsets(state->offsets, cfg->offset_max);
 
-    // Precompute derived head stats
     if (!fallback_active) {
         for (uint32_t h = 0; h < cal->n_sampled; h++) {
             const uint32_t layer_idx = cal->sampled_layer[h];
@@ -636,14 +611,11 @@ triattention_state * triattention_init(
         }
     }
 
-    // Allocate cell position tracking
     state->cell_positions = new int32_t[state->kv_size];
     for (uint32_t i = 0; i < state->kv_size; i++) {
         state->cell_positions[i] = -1;
     }
 
-    // Allocate scratch buffers
-    // These are sized for worst-case (scoring all cells)
     state->dequant_buf  = new float[(size_t) state->kv_size * state->max_padded_head_dim];
     state->rope_buf     = new float[(size_t) state->kv_size * state->max_rope_dim];
     state->unrot_buf    = new float[(size_t) state->kv_size * state->max_rope_dim];
@@ -651,19 +623,75 @@ triattention_state * triattention_init(
     state->combined_buf = new float[state->kv_size];
     state->keep_indices = new uint32_t[cfg->budget];
 
-    // Init monitoring
     state->total_prune_calls   = 0;
     state->total_tokens_evicted = 0;
     state->total_prune_time_ms = 0.0;
     state->last_prune_time_ms  = 0.0;
 
-    fprintf(stderr, "[TriAttention] Initialized: %s, budget=%u, window=%u, mode=%d, offsets=%u, "
+    fprintf(stderr, "[TriAttention] Initialized: %s, source=%s, budget=%u, window=%u, mode=%d, offsets=%u, "
             "kv_size=%u, sampled_heads=%u\n",
             fallback_active ? "experimental fallback" : "calibrated",
+            resolved_source,
             cfg->budget, cfg->divide_length, (int)cfg->mode,
             state->n_offsets, state->kv_size, cal->n_sampled);
 
     return state;
+}
+
+triattention_state * triattention_init(
+    const char * stats_path,
+    const triattention_config * cfg,
+    const triattention_model_params * model,
+    const uint32_t * sampled_layers,
+    uint32_t n_sampled_layers)
+{
+    if (!cfg || !model) {
+        return nullptr;
+    }
+
+    triattention_calibration * full_cal = nullptr;
+    bool fallback_active = false;
+
+    if (stats_path && stats_path[0] != '\0') {
+        full_cal = triattention_calibration_load(stats_path);
+        if (!full_cal) {
+            return nullptr;
+        }
+        if (!triattention_calibration_validate(full_cal, model, true)) {
+            triattention_calibration_free(full_cal);
+            return nullptr;
+        }
+    } else {
+        if (cfg->fallback_mode == TRIATTENTION_FALLBACK_OFF) {
+            fprintf(stderr, "[TriAttention] ERROR: no calibration file was provided and fallback is disabled\n");
+            return nullptr;
+        }
+        if (cfg->fallback_mode != TRIATTENTION_FALLBACK_AUTO &&
+            cfg->fallback_mode != TRIATTENTION_FALLBACK_HYBRID_NORM_RECENCY) {
+            fprintf(stderr, "[TriAttention] ERROR: unsupported fallback mode %d\n", (int) cfg->fallback_mode);
+            return nullptr;
+        }
+        fallback_active = true;
+    }
+    triattention_state * state = triattention_init_internal(full_cal, fallback_active, stats_path, cfg, model, sampled_layers, n_sampled_layers);
+    triattention_calibration_free(full_cal);
+    return state;
+}
+
+triattention_state * triattention_init_from_calibration(
+    const triattention_calibration * calibration,
+    const char * source_name,
+    const triattention_config * cfg,
+    const triattention_model_params * model,
+    const uint32_t * sampled_layers,
+    uint32_t n_sampled_layers) {
+    if (!cfg || !model || !calibration) {
+        return nullptr;
+    }
+    if (!triattention_calibration_validate(calibration, model, true)) {
+        return nullptr;
+    }
+    return triattention_init_internal(calibration, false, source_name, cfg, model, sampled_layers, n_sampled_layers);
 }
 
 void triattention_free(triattention_state * state) {

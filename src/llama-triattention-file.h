@@ -2,8 +2,13 @@
 
 #include "llama-triattention.h"
 
+#include <cstddef>
+#include <vector>
+
 struct llama_model;
 struct llama_cparams;
+
+static constexpr const char * TRIATTENTION_GGUF_KEY = "triattention.calibration";
 
 struct triattention_rope_params {
     uint32_t n_dims;
@@ -32,6 +37,16 @@ bool triattention_model_params_init(
     const llama_cparams * cparams,
     uint32_t kv_size,
     triattention_model_params * out);
+
+triattention_calibration * triattention_calibration_load_from_buffer(
+    const void * data,
+    size_t size,
+    bool verbose = true,
+    const char * source_name = nullptr);
+
+bool triattention_calibration_save_to_buffer(
+    const triattention_calibration * cal,
+    std::vector<uint8_t> & out);
 
 triattention_calibration * triattention_calibration_load(const char * path, bool verbose = true);
 bool triattention_calibration_save(const char * path, const triattention_calibration * cal);

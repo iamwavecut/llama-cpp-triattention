@@ -35,7 +35,7 @@ There are now two runtime modes:
 
 | Mode | Status | What it needs |
 |------|--------|---------------|
-| `calibrated` | Canonical | A `.triattention` file built from a representative text corpus |
+| `calibrated` | Canonical | Embedded calibration in the `GGUF` or an external `.triattention` artifact |
 | `experimental fallback` | Heuristic | No calibration file; runtime uses norm+recency scoring |
 
 Calibration remains the paper-aligned path. The fallback mode exists so inference can still run without precomputed query statistics, but it is not equivalent to the method described in the paper.
@@ -56,21 +56,40 @@ GPU scoring is ~1,000× faster than CPU. The 4.3× generation speedup comes from
 cmake --build build --target llama-server llama-triattention-calibrate -j
 ```
 
-Build a calibration file from a plain-text corpus:
+Build a calibrated `GGUF` from a plain-text corpus:
 
 ```bash
-./build/bin/llama-triattention-calibrate -m YourModel.gguf -f corpus.txt -o model.triattention \
+./build/bin/llama-triattention-calibrate -m YourModel.gguf -f corpus.txt -o YourModel.triattention.gguf \
   -c 8192 -b 2048
 ```
 
-Inspect or validate the resulting file:
+To emit only an external calibration artifact instead:
 
 ```bash
+./build/bin/llama-triattention-calibrate -m YourModel.gguf -f corpus.txt \
+  --external-out model.triattention --no-embed \
+  -c 8192 -b 2048
+```
+
+Inspect or validate either form:
+
+```bash
+./build/bin/llama-triattention-calibrate --inspect YourModel.triattention.gguf
+./build/bin/llama-triattention-calibrate --validate YourModel.triattention.gguf
 ./build/bin/llama-triattention-calibrate --inspect model.triattention
 ./build/bin/llama-triattention-calibrate --validate model.triattention -m YourModel.gguf
 ```
 
 Run calibrated TriAttention:
+
+```bash
+./build/bin/llama-server -m YourModel.triattention.gguf -c 32768 -ngl 99 --port 8080 \
+  --triattention-budget 4096 \
+  --triattention-window 256 \
+  --triattention-log
+```
+
+Or keep the original model and pass an explicit external artifact:
 
 ```bash
 ./build/bin/llama-server -m YourModel.gguf -c 32768 -ngl 99 --port 8080 \
@@ -94,7 +113,7 @@ Run experimental fallback without a stats file:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--triattention-stats <file>` | *(none)* | Calibration file. Preferred path; when omitted, runtime can fall back to the experimental heuristic |
+| `--triattention-stats <file>` | *(none)* | Explicit external calibration artifact. Checked only when the loaded `GGUF` does not already embed calibration |
 | `--triattention-budget <n>` | `512` | Maximum KV tokens to retain after each prune |
 | `--triattention-window <n>` | `64` | Pruning interval in decode tokens; the most recent `N` positions are also protected |
 | `--triattention-offset-max <n>` | `65536` | Maximum geometric offset used by trig scoring |
@@ -113,6 +132,13 @@ Run experimental fallback without a stats file:
 3. In calibrated mode, cached keys are scored against offline query statistics collected from pre-RoPE `Q`
 4. In fallback mode, cached keys are scored with a norm+recency heuristic using the same RoPE-inverted key path
 5. The top-`budget` positions are kept and the rest are evicted
+
+Runtime calibration resolution order:
+
+1. Embedded calibration inside the loaded `GGUF`
+2. Explicit `--triattention-stats <file>`
+3. Sidecar `<model>.triattention` next to the loaded model
+4. Experimental fallback, if enabled
 
 ---
 

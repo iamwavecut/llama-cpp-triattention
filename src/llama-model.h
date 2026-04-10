@@ -564,6 +564,8 @@ struct llama_model {
 
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
+    std::string path_model;
+    std::vector<uint8_t> triattention_calibration_embedded;
 
     // list of devices used in this model
     std::vector<llama_device> devices;

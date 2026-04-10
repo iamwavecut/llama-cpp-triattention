@@ -319,6 +319,14 @@ triattention_state * triattention_init(
     const uint32_t * sampled_layers,
     uint32_t n_sampled_layers);
 
+triattention_state * triattention_init_from_calibration(
+    const triattention_calibration * calibration,
+    const char * source_name,
+    const triattention_config * cfg,
+    const triattention_model_params * model,
+    const uint32_t * sampled_layers,
+    uint32_t n_sampled_layers);
+
 // Free all memory associated with a TriAttention state.
 // Safe to call with nullptr.
 void triattention_free(triattention_state * state);

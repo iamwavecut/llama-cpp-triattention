@@ -12,6 +12,7 @@ struct llama_cparams;
 struct llama_hparams;
 struct llama_model;
 struct llama_context;
+struct triattention_calibration;
 struct triattention_state;
 struct triattention_config;
 struct triattention_model_params;
@@ -233,9 +234,10 @@ public:
     //
 
     // Initialize TriAttention on this cache. Called after construction.
-    // Does nothing if stats_path is nullptr or empty.
+    // calibration == nullptr selects the fallback path.
     void init_triattention(
-        const char * stats_path,
+        const triattention_calibration * calibration,
+        const char * calibration_source,
         const triattention_config * cfg,
         const triattention_model_params * model_params,
         const uint32_t * sampled_layers,

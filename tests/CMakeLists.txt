@@ -268,6 +268,7 @@ endif()
 
 set(TRIATTENTION_CORPUS "${PROJECT_SOURCE_DIR}/tests/triattention-corpus.txt")
 set(TRIATTENTION_FILE "${CMAKE_BINARY_DIR}/triattention-smoke.triattention")
+set(TRIATTENTION_GGUF "${CMAKE_BINARY_DIR}/triattention-smoke.gguf")
 
 add_test(
     NAME test-triattention-calibrate-build
@@ -275,7 +276,8 @@ add_test(
     COMMAND $<TARGET_FILE:llama-triattention-calibrate>
         -m "${MODEL_DEST}"
         -f "${TRIATTENTION_CORPUS}"
-        -o "${TRIATTENTION_FILE}"
+        -o "${TRIATTENTION_GGUF}"
+        --external-out "${TRIATTENTION_FILE}"
         -c 64
         -b 64
         -ngl 0
@@ -289,8 +291,7 @@ add_test(
     NAME test-triattention-calibrate-inspect
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
     COMMAND $<TARGET_FILE:llama-triattention-calibrate>
-        --inspect "${TRIATTENTION_FILE}"
-        -m "${MODEL_DEST}"
+        --inspect "${TRIATTENTION_GGUF}"
 )
 set_tests_properties(test-triattention-calibrate-inspect PROPERTIES
     LABELS "model"
@@ -300,8 +301,8 @@ add_test(
     NAME test-triattention-calibrate-validate
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
     COMMAND $<TARGET_FILE:llama-triattention-calibrate>
-        --validate "${TRIATTENTION_FILE}"
-        -m "${MODEL_DEST}"
+        --validate "${TRIATTENTION_GGUF}"
+        -m "${TRIATTENTION_GGUF}"
         -ngl 0
 )
 set_tests_properties(test-triattention-calibrate-validate PROPERTIES
@@ -312,7 +313,7 @@ add_test(
     NAME test-triattention-runtime-calibrated
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
     COMMAND $<TARGET_FILE:llama-cli>
-        -m "${MODEL_DEST}"
+        -m "${TRIATTENTION_GGUF}"
         -f "${TRIATTENTION_CORPUS}"
         -st
         -no-cnv
@@ -321,7 +322,6 @@ add_test(
         -ngl 0
         -c 64
         -n 2
-        --triattention-stats "${TRIATTENTION_FILE}"
         --triattention-budget 4
         --triattention-window 2
 )

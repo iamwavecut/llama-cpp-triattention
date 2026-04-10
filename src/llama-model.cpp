@@ -6,6 +6,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-triattention-file.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -677,6 +678,9 @@ void llama_model::load_arch(llama_model_loader & ml) {
 
 void llama_model::load_hparams(llama_model_loader & ml) {
     const gguf_context * ctx = ml.metadata;
+    path_model = ml.path_model;
+    triattention_calibration_embedded.clear();
+    ml.get_arr(TRIATTENTION_GGUF_KEY, triattention_calibration_embedded, false);
 
     // get metadata as string
     for (int i = 0; i < gguf_get_n_kv(ctx); i++) {

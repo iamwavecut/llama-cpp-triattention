@@ -29,7 +29,7 @@ Initializes TriAttention on a `llama_context`.
 | Parameter | Description |
 |-----------|-------------|
 | `ctx` | Context whose KV cache will be pruned |
-| `stats_path` | Optional path to a `.triattention` file |
+| `stats_path` | Optional explicit path to an external `.triattention` file |
 | `budget` | Maximum KV entries retained after pruning |
 | `divide_length` | Pruning interval; the same recent window is protected from eviction |
 | `offset_max` | Maximum geometric offset for trig scoring |
@@ -55,14 +55,27 @@ Returns `0` on success and `-1` on failure.
 triattention_state * triattention_init(
     const char * stats_path,
     const triattention_config * cfg,
-    const triattention_model_params * model);
+    const triattention_model_params * model,
+    const uint32_t * sampled_layers,
+    uint32_t n_sampled_layers);
+
+triattention_state * triattention_init_from_calibration(
+    const triattention_calibration * calibration,
+    const char * source_name,
+    const triattention_config * cfg,
+    const triattention_model_params * model,
+    const uint32_t * sampled_layers,
+    uint32_t n_sampled_layers);
 
 void triattention_free(triattention_state * state);
 ```
 
-`triattention_init()` loads and validates the calibration file when one is
-provided. If no file is provided and fallback is enabled, it constructs a
-fallback calibration state from model geometry and RoPE parameters.
+`triattention_init()` resolves calibration in this order:
+
+1. Embedded calibration inside the loaded `GGUF`
+2. Explicit `stats_path`
+3. Sidecar `<model>.triattention`
+4. Runtime fallback, if enabled
 
 ### Scoring and pruning helpers
 
@@ -127,7 +140,15 @@ bool triattention_build_rope_arrays(
     const triattention_rope_params * params);
 
 triattention_calibration * triattention_calibration_load(const char * path, bool verbose);
+triattention_calibration * triattention_calibration_load_from_buffer(
+    const void * data,
+    size_t size,
+    bool verbose,
+    const char * source_name);
 bool triattention_calibration_save(const char * path, const triattention_calibration * cal);
+bool triattention_calibration_save_to_buffer(
+    const triattention_calibration * cal,
+    std::vector<uint8_t> & out);
 void triattention_calibration_free(triattention_calibration * cal);
 
 bool triattention_calibration_validate(
@@ -303,7 +324,7 @@ Supported modes:
 
 | Mode | Example |
 |------|---------|
-| Build | `llama-triattention-calibrate -m model.gguf -f corpus.txt -o model.triattention` |
-| Inspect | `llama-triattention-calibrate --inspect model.triattention` |
-| Validate | `llama-triattention-calibrate --validate model.triattention -m model.gguf` |
-
+| Build embedded `GGUF` | `llama-triattention-calibrate -m model.gguf -f corpus.txt -o model.triattention.gguf` |
+| Build external artifact | `llama-triattention-calibrate -m model.gguf -f corpus.txt --external-out model.triattention --no-embed` |
+| Inspect | `llama-triattention-calibrate --inspect model.triattention.gguf` |
+| Validate | `llama-triattention-calibrate --validate model.triattention.gguf` |

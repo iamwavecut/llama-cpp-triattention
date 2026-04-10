@@ -155,6 +155,8 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_MXFP4_MOE     = 38, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_TQ3_1S        = 43, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_TQ4_1S        = 44, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -786,7 +788,12 @@ extern "C" {
     //
 
     // Initialize TriAttention on the context's KV cache.
-    // stats_path: path to .triattention binary calibration file (optional when fallback is enabled)
+    // Calibration resolution order:
+    //   1. embedded calibration inside the loaded GGUF
+    //   2. explicit stats_path
+    //   3. sidecar <model>.triattention
+    //   4. runtime fallback (if enabled)
+    // stats_path: optional explicit path to an external .triattention calibration file
     // budget: max KV entries to retain after pruning
     // divide_length: pruning interval in tokens
     // offset_max: max geometric offset for scoring

@@ -11,6 +11,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -437,31 +438,33 @@ llama_kv_cache::llama_kv_cache(
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
     }
 
+    // TurboQuant uses kernel-level WHT in backend kernels. Keep the legacy
+    // graph-side rotation disabled by default and allow opt-in via env override.
     const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
-    const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? atoi(LLAMA_ATTN_ROT_DISABLE) : false;
+    const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? atoi(LLAMA_ATTN_ROT_DISABLE) : true;
     if (attn_rot_disable) {
-        LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
+        LLAMA_LOG_INFO("%s: upstream attention rotation disabled (TurboQuant uses kernel-level WHT)\n", __func__);
     }
 
     attn_rot_k =
         !attn_rot_disable &&
-        n_embd_head_k_all > 0 &&
         ggml_is_quantized(type_k) &&
+        !hparams.is_n_embd_k_gqa_variable() &&
         hparams.n_embd_head_k() % 64 == 0;
 
     attn_rot_v =
         !attn_rot_disable &&
-        n_embd_head_v_all > 0 &&
         ggml_is_quantized(type_v) &&
+        !hparams.is_n_embd_v_gqa_variable() &&
         hparams.n_embd_head_v() % 64 == 0;
 
-    LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_k, n_embd_head_k_all);
-    LLAMA_LOG_INFO("%s: attn_rot_v = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_v, n_embd_head_v_all);
+    LLAMA_LOG_INFO("%s: attn_rot_k = %d\n", __func__, attn_rot_k);
+    LLAMA_LOG_INFO("%s: attn_rot_v = %d\n", __func__, attn_rot_v);
 
     // pre-compute the haramard matrices and keep them in host memory
     // TODO: in the future, we can make copies in the backend buffers to avoid host -> device transfers
     if (attn_rot_k || attn_rot_v) {
-        for (int64_t n = 64; n <= std::max(n_embd_head_k_all, n_embd_head_v_all); n *= 2) {
+        for (int64_t n = 64; n <= std::max(hparams.n_embd_head_k(), hparams.n_embd_head_v()); n *= 2) {
             attn_rot_hadamard[n] = std::vector<float>(n*n);
 
             ggml_init_params params = {
@@ -1586,7 +1589,7 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
         // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
         do {
             nrot *= 2;
-        } while (n_embd_head_k_all % nrot == 0);
+        } while (hparams.n_embd_head_k() % nrot == 0);
         nrot /= 2;
 
         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
@@ -2651,7 +2654,72 @@ int32_t llama_kv_cache::triattention_init_from_model(
     std::sort(sampled_layers.begin(), sampled_layers.end());
     sampled_layers.erase(std::unique(sampled_layers.begin(), sampled_layers.end()), sampled_layers.end());
 
-    init_triattention(stats_path, cfg, &model_params, sampled_layers.data(), (uint32_t) sampled_layers.size());
+    auto init_from_calibration = [&](triattention_calibration * cal, const char * source) -> bool {
+        if (!cal) {
+            return false;
+        }
+
+        const bool ok = triattention_calibration_validate(cal, &model_params, true);
+        if (ok) {
+            init_triattention(cal, source, cfg, &model_params, sampled_layers.data(), (uint32_t) sampled_layers.size());
+        }
+        triattention_calibration_free(cal);
+        return ok && triattention_st != nullptr;
+    };
+
+    if (!model.triattention_calibration_embedded.empty()) {
+        if (stats_path && stats_path[0] != '\0') {
+            LLAMA_LOG_INFO("%s: using embedded TriAttention calibration from GGUF and ignoring explicit stats path '%s'\n",
+                    __func__, stats_path);
+        } else {
+            LLAMA_LOG_INFO("%s: using embedded TriAttention calibration from GGUF metadata\n", __func__);
+        }
+
+        triattention_calibration * embedded = triattention_calibration_load_from_buffer(
+            model.triattention_calibration_embedded.data(),
+            model.triattention_calibration_embedded.size(),
+            true,
+            TRIATTENTION_GGUF_KEY);
+        if (!embedded || !init_from_calibration(embedded, "embedded-gguf")) {
+            triattention_model_params_clear(&model_params);
+            return -1;
+        }
+
+        triattention_model_params_clear(&model_params);
+        return 0;
+    }
+
+    if (stats_path && stats_path[0] != '\0') {
+        triattention_calibration * explicit_cal = triattention_calibration_load(stats_path);
+        if (!explicit_cal || !init_from_calibration(explicit_cal, stats_path)) {
+            triattention_model_params_clear(&model_params);
+            return -1;
+        }
+
+        triattention_model_params_clear(&model_params);
+        return 0;
+    }
+
+    if (!model.path_model.empty()) {
+        std::filesystem::path sidecar_path(model.path_model);
+        sidecar_path.replace_extension(".triattention");
+        std::error_code ec;
+        if (std::filesystem::exists(sidecar_path, ec)) {
+            const std::string sidecar = sidecar_path.string();
+            LLAMA_LOG_INFO("%s: probing sidecar TriAttention calibration %s\n", __func__, sidecar.c_str());
+            triattention_calibration * sidecar_cal = triattention_calibration_load(sidecar.c_str(), false);
+            if (!sidecar_cal) {
+                LLAMA_LOG_WARN("%s: ignoring unreadable TriAttention sidecar %s\n", __func__, sidecar.c_str());
+            } else if (!init_from_calibration(sidecar_cal, sidecar.c_str())) {
+                LLAMA_LOG_WARN("%s: ignoring incompatible TriAttention sidecar %s\n", __func__, sidecar.c_str());
+            } else {
+                triattention_model_params_clear(&model_params);
+                return 0;
+            }
+        }
+    }
+
+    init_triattention(nullptr, nullptr, cfg, &model_params, sampled_layers.data(), (uint32_t) sampled_layers.size());
     triattention_model_params_clear(&model_params);
     return triattention_st ? 0 : -1;
 }
@@ -2661,7 +2729,8 @@ bool llama_kv_cache::triattention_is_active() const {
 }
 
 void llama_kv_cache::init_triattention(
-    const char * stats_path,
+    const triattention_calibration * calibration,
+    const char * calibration_source,
     const triattention_config * cfg,
     const triattention_model_params * model_params,
     const uint32_t * sampled_layers,
@@ -2674,10 +2743,12 @@ void llama_kv_cache::init_triattention(
         triattention_st = nullptr;
     }
 
-    triattention_st = triattention_init(stats_path, cfg, model_params, sampled_layers, n_sampled_layers);
+    triattention_st = calibration
+        ? triattention_init_from_calibration(calibration, calibration_source, cfg, model_params, sampled_layers, n_sampled_layers)
+        : triattention_init(nullptr, cfg, model_params, sampled_layers, n_sampled_layers);
     if (!triattention_st) {
-        LLAMA_LOG_ERROR("%s: failed to initialize TriAttention (stats=%s)\n",
-                __func__, stats_path && stats_path[0] ? stats_path : "<none>");
+        LLAMA_LOG_ERROR("%s: failed to initialize TriAttention (source=%s)\n",
+                __func__, calibration_source && calibration_source[0] ? calibration_source : "<fallback>");
     }
 }
 

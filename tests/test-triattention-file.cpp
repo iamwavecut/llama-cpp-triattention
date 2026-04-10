@@ -191,6 +191,26 @@ int main() {
         std::filesystem::remove(path);
     });
 
+    t.test("buffer roundtrip preserves calibration", [](testing & t) {
+        triattention_calibration * cal = make_v3_calibration();
+        std::vector<uint8_t> buffer;
+
+        t.assert_true(triattention_calibration_save_to_buffer(cal, buffer));
+        t.assert_true(!buffer.empty());
+
+        triattention_calibration * loaded = triattention_calibration_load_from_buffer(
+            buffer.data(), buffer.size(), false, "buffer-roundtrip");
+        t.assert_true(loaded != nullptr);
+        t.assert_equal((uint32_t) TRIATTENTION_VERSION, loaded->version);
+        t.assert_equal((uint32_t) 2, loaded->n_sampled);
+        t.assert_true(approx_equal(loaded->layers[0].omega[0], 1.0f));
+        t.assert_true(approx_equal(loaded->layers[1].freq_scale_sq[1], 3.0f));
+        t.assert_true(approx_equal(loaded->head_stats[0].q_abs_mean[1], 6.0f));
+
+        triattention_calibration_free(loaded);
+        triattention_calibration_free(cal);
+    });
+
     t.test("v1 calibration loads and validates", [](testing & t) {
         const std::filesystem::path path = temp_path("triattention-v1");
         t.assert_true(write_v1_fixture(path));
